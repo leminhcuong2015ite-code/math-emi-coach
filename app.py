@@ -1,5 +1,6 @@
 import re
 import io
+import time
 import difflib
 import streamlit as st
 import streamlit.components.v1 as components
@@ -12,7 +13,9 @@ from google.genai import types
 from supabase import create_client, Client
 
 st.set_page_config(page_title="Math EMI Coach Cloud", page_icon="📐", layout="centered")
-MODEL_NAME = "gemini-3.8-flash"
+
+# Danh sách các model ưu tiên (nếu model đầu bị quá tải 503 sẽ tự động thử lại và chuyển model)
+FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.5-pro"]
 
 # --- 1. KẾT NỐI SUPABASE & GEMINI API KEY ---
 RAW_SUPABASE_URL = st.secrets.get("SUPABASE_URL", "https://snrwrbqhmsjjhibuwcel.supabase.co")
@@ -55,7 +58,34 @@ class GeminiOutput(BaseModel):
     classroom_phrases: list[ClassroomPhrase]
     practice_prompt: str
 
-# --- 3. HÀM TỰ ĐỘNG TÍNH ĐỘ DÀI CÂU & CHUYỂN ĐỔI LATEX ---
+# --- 3. HÀM GỌI GEMINI CHỐNG QUÁ TẢI 503 (AUTO-RETRY & FALLBACK) ---
+def generate_with_retry(client: genai.Client, contents, config=None, max_retries: int = 4):
+    """Tự động thử lại khi Google báo 503 UNAVAILABLE (High demand) hoặc 429"""
+    last_err = None
+    for attempt in range(max_retries):
+        for model_name in FALLBACK_MODELS:
+            try:
+                return client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config,
+                )
+            except Exception as e:
+                err_str = str(e)
+                last_err = e
+                # Nếu model dự phòng không tồn tại (404), chuyển ngay sang model kế tiếp
+                if "404" in err_str or "NOT_FOUND" in err_str:
+                    continue
+                # Nếu quá tải 503 hoặc giới hạn 429, đợi một chút rồi thử lại
+                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
+                    wait_sec = (attempt + 1) * 4
+                    st.toast(f"⏳ Máy chủ AI đang đông ({model_name}), tự động thử lại sau {wait_sec}s (Lần {attempt+1}/{max_retries})...")
+                    time.sleep(wait_sec)
+                    break
+                raise e
+    raise last_err
+
+# --- 4. HÀM TỰ ĐỘNG TÍNH ĐỘ DÀI CÂU & CHUYỂN ĐỔI LATEX ---
 def get_smart_duration(item_dict: dict, sentence_text: str, extra_buffer: int = 1) -> int:
     ai_dur = item_dict.get("duration", 0)
     if ai_dur and ai_dur >= 3:
@@ -65,17 +95,11 @@ def get_smart_duration(item_dict: dict, sentence_text: str, extra_buffer: int = 
     return estimated + extra_buffer
 
 def escape_latex(text: str) -> str:
-    """Bảo vệ các ký tự đặc biệt của LaTeX nhưng giữ nguyên công thức trong cặp dấu $...$"""
     if not text:
         return ""
     parts = re.split(r'(\$.*?\$)', text)
     escaped_parts = []
-    replacements = {
-        '&': r'\&',
-        '%': r'\%',
-        '#': r'\#',
-        '_': r'\_',
-    }
+    replacements = {'&': r'\&', '%': r'\%', '#': r'\#', '_': r'\_'}
     for part in parts:
         if part.startswith('$') and part.endswith('$') and len(part) >= 2:
             escaped_parts.append(part)
@@ -86,7 +110,6 @@ def escape_latex(text: str) -> str:
     return "".join(escaped_parts)
 
 def generate_latex_document(data: dict, full_document: bool = True) -> str:
-    """Sinh mã LaTeX phiếu bài giảng & luyện tập EMI từ dữ liệu phân tích"""
     video_id = data["video_id"]
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     summary = escape_latex(data["lesson_summary"])
@@ -194,7 +217,7 @@ def generate_latex_document(data: dict, full_document: bool = True) -> str:
     closing = "\n\\end{document}\n"
     return preamble + body_content + closing
 
-# --- 4. TRÌNH PHÁT YOUTUBE LẶP CÂU TỰ ĐỘNG + NÚT TINH CHỈNH TỨC THÌ ---
+# --- 5. TRÌNH PHÁT YOUTUBE LẶP CÂU TỰ ĐỘNG + NÚT TINH CHỈNH TỨC THÌ ---
 def render_youtube_player(video_id: str, start_sec: int = 0, duration: int = 6, autoplay: int = 1, loop_clip: bool = True):
     end_sec = start_sec + duration
     if not loop_clip:
@@ -322,7 +345,7 @@ def render_youtube_player(video_id: str, start_sec: int = 0, duration: int = 6, 
     """
     components.html(loop_html, height=300)
 
-# --- 5. HÀM TEXT-TO-SPEECH ĐỌC CHUẨN & ĐỌC CHẬM ---
+# --- 6. HÀM TEXT-TO-SPEECH ĐỌC CHUẨN & ĐỌC CHẬM ---
 @st.cache_data(show_spinner=False)
 def generate_tts_audio(text: str, slow: bool = False) -> bytes:
     clean_for_speech = re.sub(r'[\$\\\{\}\_\^]', ' ', text)
@@ -343,7 +366,7 @@ def render_tts_buttons(text: str, key_prefix: str):
     if f"tts_{key_prefix}" in st.session_state:
         st.audio(st.session_state[f"tts_{key_prefix}"], format="audio/mp3", autoplay=True)
 
-# --- 6. HÀM XỬ LÝ PHÂN TÍCH & LƯU TRỮ SUPABASE CLOUD ---
+# --- 7. HÀM XỬ LÝ PHÂN TÍCH & LƯU TRỮ SUPABASE CLOUD ---
 def extract_video_id(url: str) -> str | None:
     pattern = r"(?:v=|\/|youtu\.be\/|shorts\/)([0-9A-Za-z_-]{11}).*"
     match = re.search(pattern, url)
@@ -373,7 +396,7 @@ def trigger_analysis(url_to_analyze: str, force_refresh: bool = False):
         st.error("Vui lòng nhập Gemini API Key ở thanh bên trái (hoặc cấu hình trong Secrets).")
         return
 
-    with st.spinner("Đang phân tích chuyên sâu bài giảng bằng Gemini AI (1-3 phút)..."):
+    with st.spinner("Đang phân tích chuyên sâu bài giảng bằng Gemini AI (1-3 phút, tự động thử lại nếu máy chủ đông)..."):
         use_direct_video = False
         transcript_text = ""
         try:
@@ -404,14 +427,15 @@ def trigger_analysis(url_to_analyze: str, force_refresh: bool = False):
             else:
                 contents_payload = f"{base_prompt}\nTranscript:\n{transcript_text[:30000]}"
 
-            response = client.models.generate_content(
-                model=MODEL_NAME,
+            response = generate_with_retry(
+                client=client,
                 contents=contents_payload,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=GeminiOutput,
                     temperature=0.3,
                 ),
+                max_retries=4
             )
             parsed = GeminiOutput.model_validate_json(response.text)
             full_data = {"video_id": video_id, "from_cache": False, **parsed.model_dump()}
@@ -433,13 +457,14 @@ def trigger_analysis(url_to_analyze: str, force_refresh: bool = False):
 def evaluate_audio_with_gemini(audio_bytes: bytes, prompt_text: str) -> str:
     api_key = st.session_state.get("api_key", "").strip()
     client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=300000))
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=[types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"), prompt_text]
+    response = generate_with_retry(
+        client=client,
+        contents=[types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"), prompt_text],
+        max_retries=3
     )
     return response.text
 
-# --- 7. THANH BÊN (SIDEBAR): CẤU HÌNH & KHO BÀI GIẢNG CLOUD ---
+# --- 8. THANH BÊN (SIDEBAR): CẤU HÌNH & KHO BÀI GIẢNG CLOUD ---
 with st.sidebar:
     st.header("⚙️ Cấu hình Cloud")
     api_key = st.text_input("Gemini API Key:", value=DEFAULT_GEMINI_KEY, type="password")
@@ -483,7 +508,7 @@ with st.sidebar:
     else:
         st.warning("Chưa cấu hình SUPABASE_URL và SUPABASE_KEY.")
 
-# --- 8. GIAO DIỆN CHÍNH ---
+# --- 9. GIAO DIỆN CHÍNH ---
 st.title("📐 Math EMI Coach")
 
 if "last_analyzed_url" not in st.session_state:
