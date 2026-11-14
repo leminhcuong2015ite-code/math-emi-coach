@@ -36,7 +36,7 @@ def init_supabase() -> Client | None:
 db = init_supabase()
 query_url = st.query_params.get("url", "")
 
-# --- 2. CẤU TRÚC DỮ LIỆU AI ---
+# --- 2. CẤU TRÚC DỮ LIỆU AI (BAO GỒM HỘI THOẠI & SCRIPT GIẢNG MẪU) ---
 class MathVocab(BaseModel):
     term: str = Field(description="Thuật ngữ toán học tiếng Anh (chỉ 1-3 từ)")
     phonetic: str = Field(description="Phiên âm IPA")
@@ -52,6 +52,24 @@ class ClassroomPhrase(BaseModel):
     timestamp: int = Field(description="Mốc thời gian bắt đầu câu nói (giây)")
     duration: int = Field(default=0, description="Thời lượng giáo viên nói hết câu phrase này (tính bằng giây, thường từ 4 đến 12 giây)")
 
+class DialogueTurn(BaseModel):
+    student_line: str = Field(description="Câu hỏi hoặc thắc mắc của học sinh bằng tiếng Anh (có liên quan đến từ vựng Toán trong bài)")
+    student_vi: str = Field(description="Nghĩa tiếng Việt của câu học sinh nói")
+    teacher_line: str = Field(description="Câu trả lời/hướng dẫn mẫu của giáo viên bằng tiếng Anh để người dùng luyện đọc và thu âm")
+    teacher_vi: str = Field(description="Nghĩa tiếng Việt của câu giáo viên nói")
+    target_vocab: str = Field(description="Thuật ngữ Toán hoặc mẫu câu trọng tâm được sử dụng trong lượt lời này")
+
+class SampleTeachingScript(BaseModel):
+    style_title: str = Field(description="Tên phong cách giảng (VD: Phong cách Cơ bản & Rõ ràng / Phong cách Gợi mở Socratic / Phong cách Bản xứ Tự nhiên)")
+    english_script: str = Field(description="Đoạn script lời giảng tiếng Anh hoàn chỉnh (4-6 câu) giải quyết tình huống practice_prompt")
+    vietnamese_translation: str = Field(description="Bản dịch nghĩa tiếng Việt tương ứng")
+    pedagogical_notes: str = Field(description="Điểm sáng sư phạm & các cụm từ đắt giá cần học hỏi từ đoạn script này")
+
+class ExtraScriptsOutput(BaseModel):
+    roleplay_scenario: str = Field(description="Bối cảnh ngắn gọn của cuộc hội thoại giữa Giáo viên và Học sinh")
+    roleplay_dialogue: list[DialogueTurn] = Field(description="Đoạn hội thoại gồm 4 lượt trao đổi qua lại giữa Học sinh và Giáo viên")
+    sample_teaching_scripts: list[SampleTeachingScript] = Field(description="3 đoạn script giảng mẫu theo 3 phong cách khác nhau cho tình huống Giảng thử")
+
 class GeminiOutput(BaseModel):
     suggested_title: str = Field(description="Tiêu đề ngắn gọn cho bài giảng (dưới 8 từ, tiếng Việt, ví dụ: Giải phương trình bậc nhất)")
     suggested_category: str = Field(description="Tên mục lục/chuyên đề Toán (ví dụ: Đại số, Hình học, Giải tích, Số học)")
@@ -59,6 +77,9 @@ class GeminiOutput(BaseModel):
     vocabularies: list[MathVocab]
     classroom_phrases: list[ClassroomPhrase]
     practice_prompt: str
+    roleplay_scenario: str = Field(description="Bối cảnh ngắn gọn của cuộc hội thoại giữa Giáo viên và Học sinh xoay quanh các từ vựng đang học")
+    roleplay_dialogue: list[DialogueTurn] = Field(description="Đoạn hội thoại gồm 4 lượt phản hồi qua lại giữa Học sinh và Giáo viên")
+    sample_teaching_scripts: list[SampleTeachingScript] = Field(description="3 đoạn script giảng mẫu theo 3 phong cách cho tình huống practice_prompt")
 
 # --- 3. HÀM GỌI GEMINI CHỐNG QUÁ TẢI 503 ---
 def generate_with_retry(client: genai.Client, contents, config=None, max_retries: int = 4):
@@ -84,7 +105,7 @@ def generate_with_retry(client: genai.Client, contents, config=None, max_retries
                 raise e
     raise last_err
 
-# --- 4. HÀM QUẢN LÝ MỤC LỤC, ĐỔI TÊN & ĐÁNH DẤU HOÀN THÀNH TRÊN SUPABASE ---
+# --- 4. HÀM QUẢN LÝ MỤC LỤC, ĐỔI TÊN & BỔ SUNG DỮ LIỆU CHO BÀI HỌC CŨ ---
 def update_lesson_metadata(video_id: str, new_title: str, new_folder: str):
     if not db:
         return
@@ -123,6 +144,60 @@ def mark_lesson_completed(video_id: str, score_pct: int):
             st.session_state["analysis"]["is_completed"] = True
             st.session_state["analysis"]["best_score"] = analysis_data["best_score"]
 
+def generate_missing_scripts_for_old_lesson(data: dict):
+    """Tạo bổ sung Kịch bản Hội thoại & Script Giảng thử cho các bài học cũ đã lưu từ trước"""
+    api_key = st.session_state.get("api_key", "").strip()
+    if not api_key:
+        st.error("Vui lòng nhập Gemini API Key ở thanh bên trái.")
+        return
+
+    vocab_str = ", ".join([f"{v['term']} ({v['meaning']})" for v in data.get("vocabularies", [])])
+    phrase_str = "; ".join([p["phrase"] for p in data.get("classroom_phrases", [])[:6]])
+    prompt_ctx = data.get("practice_prompt", "")
+
+    with st.spinner("AI đang biên soạn Kịch bản Hội thoại (Role-play) & 3 Script Giảng mẫu và lưu vào Cloud..."):
+        try:
+            client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=300000))
+            prompt = f"""
+            Bạn là chuyên gia đào tạo giáo viên Toán tiếng Anh (EMI). Dựa trên dữ liệu bài học sau:
+            - Tóm tắt bài giảng: {data.get('lesson_summary', '')}
+            - Các thuật ngữ Toán đang học: {vocab_str}
+            - Các mẫu câu sư phạm: {phrase_str}
+            - Tình huống giảng thử: {prompt_ctx}
+
+            Hãy thiết kế:
+            1. roleplay_scenario & roleplay_dialogue: Một đoạn hội thoại thực tế trên lớp gồm 4 lượt phản hồi qua lại (Học sinh hỏi/thắc mắc chỗ chưa hiểu -> Giáo viên giải thích/gợi mở) sử dụng trực tiếp các thuật ngữ Toán đang học ở trên.
+            2. sample_teaching_scripts: 3 đoạn Script mẫu hoàn chỉnh (mỗi đoạn 4-6 câu tiếng Anh, kèm dịch tiếng Việt và ghi chú sư phạm) để giải quyết tình huống "{prompt_ctx}" theo 3 phong cách:
+               - Phong cách 1: Cơ bản, từng bước rõ ràng (Step-by-step & Clear)
+               - Phong cách 2: Đặt câu hỏi gợi mở tương tác (Socratic & Interactive)
+               - Phong cách 3: Tự nhiên, giàu ngữ điệu như giáo viên bản xứ (Native-like & Engaging)
+            """
+            res = generate_with_retry(
+                client=client,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=ExtraScriptsOutput,
+                    temperature=0.4,
+                ),
+                max_retries=3
+            )
+            parsed = ExtraScriptsOutput.model_validate_json(res.text)
+            extra_dict = parsed.model_dump()
+            
+            data["roleplay_scenario"] = extra_dict["roleplay_scenario"]
+            data["roleplay_dialogue"] = extra_dict["roleplay_dialogue"]
+            data["sample_teaching_scripts"] = extra_dict["sample_teaching_scripts"]
+            st.session_state["analysis"] = data
+
+            if db:
+                db.table("lesson_history").update({
+                    "analysis_json": data
+                }).eq("video_id", data["video_id"]).execute()
+            st.toast("✨ Đã tạo và lưu vĩnh viễn Hội thoại & Script mẫu lên Cloud!")
+        except Exception as e:
+            st.error(f"Lỗi khi tạo kịch bản: {e}")
+
 def parse_folder_and_title(row: dict) -> tuple[str, str]:
     a_json = row.get("analysis_json") or {}
     if isinstance(a_json, dict) and a_json.get("custom_title"):
@@ -149,7 +224,7 @@ def render_folder_selector(label: str, existing_folders: list[str], current_val:
         return custom_f.strip() if custom_f.strip() else "Chưa phân loại"
     return choice
 
-# --- 5. HÀM TÍNH SỐ TỪ THEO PHÚT & CHUYỂN ĐỔI LATEX (HỖ TRỢ PHIÊN ÂM IPA CHUẨN) ---
+# --- 5. HÀM TÍNH SỐ TỪ THEO PHÚT & CHUYỂN ĐỔI LATEX (ĐƠN BÀI & GỘP CHUYÊN ĐỀ) ---
 def calculate_target_items(duration_seconds: int) -> tuple[int, float]:
     minutes = duration_seconds / 60.0
     if minutes < 10:
@@ -220,28 +295,38 @@ def ipa_to_latex(phonetic: str) -> str:
     out = "".join(ch if ord(ch) < 128 else "" for ch in out)
     return out
 
-def generate_latex_document(data: dict, full_document: bool = True) -> str:
+def generate_single_lesson_latex_body(data: dict, numbered_section: bool = False) -> str:
+    """Sinh phần thân LaTeX cho 1 bài học (Bao gồm cả Hội thoại & Script giảng mẫu nếu có)"""
     video_id = data["video_id"]
     video_url = f"https://www.youtube.com/watch?v={video_id}"
-    custom_title = escape_latex(data.get("custom_title") or "PHIẾU HỌC TẬP TOÁN TIẾNG ANH (EMI)")
-    folder_name = escape_latex(data.get("folder_name") or "Chuyên đề EMI")
-    summary = escape_latex(data["lesson_summary"])
-    practice_prompt = escape_latex(data["practice_prompt"])
+    custom_title = escape_latex(data.get("custom_title") or data.get("suggested_title") or "Bài học EMI")
+    folder_name = escape_latex(data.get("folder_name") or data.get("suggested_category") or "Chuyên đề EMI")
+    summary = escape_latex(data.get("lesson_summary", ""))
+    practice_prompt = escape_latex(data.get("practice_prompt", ""))
+
+    sec_cmd = r"\section" if numbered_section else r"\section*"
+    subsec_cmd = r"\subsection*"
 
     body_lines = [
         r"% ===================================================================",
         f"% MỤC LỤC: {folder_name} | BÀI: {custom_title} (ID: {video_id})",
         r"% ===================================================================",
+    ]
+
+    if numbered_section:
+        body_lines.append(f"{sec_cmd}{{{custom_title}}}")
+
+    body_lines.extend([
         f"\\begin{{tcolorbox}}[colback=blue!5!white,colframe=blue!75!black,title=\\textbf{{{folder_name.upper()} --- {custom_title.upper()}}}]",
         f"\\textbf{{Tóm tắt nội dung:}} {summary}\\\\[4pt]",
         f"\\textbf{{Link bài giảng gốc:}} \\href{{{video_url}}}{{\\texttt{{{video_url}}}}}",
         r"\end{tcolorbox}",
         "",
-        r"\section*{1. Thuật ngữ Toán học Trọng tâm (Key Mathematical Vocabulary)}",
+        f"{subsec_cmd}{{1. Thuật ngữ Toán học Trọng tâm (Key Mathematical Vocabulary)}}",
         r"\begin{enumerate}[label=\textbf{\arabic*.}, leftmargin=*, itemsep=6pt]"
-    ]
+    ])
 
-    for v in data["vocabularies"]:
+    for v in data.get("vocabularies", []):
         term = escape_latex(v["term"])
         phonetic_safe = ipa_to_latex(v["phonetic"])
         meaning = escape_latex(v["meaning"])
@@ -257,11 +342,11 @@ def generate_latex_document(data: dict, full_document: bool = True) -> str:
     body_lines.extend([
         r"\end{enumerate}",
         "",
-        r"\section*{2. Mẫu câu Giao tiếp Sư phạm (Classroom Pedagogical Phrases)}",
+        f"{subsec_cmd}{{2. Mẫu câu Giao tiếp Sư phạm (Classroom Pedagogical Phrases)}}",
         r"\begin{enumerate}[label=\textbf{\arabic*.}, leftmargin=*, itemsep=6pt]"
     ])
 
-    for p in data["classroom_phrases"]:
+    for p in data.get("classroom_phrases", []):
         phrase = escape_latex(p["phrase"])
         func = escape_latex(p["function"])
         vn_eq = escape_latex(p["vietnamese_equivalent"])
@@ -276,12 +361,12 @@ def generate_latex_document(data: dict, full_document: bool = True) -> str:
     body_lines.extend([
         r"\end{enumerate}",
         "",
-        r"\section*{3. Bài tập Điền từ Khuyết (Cloze Listening Drill)}",
+        f"{subsec_cmd}{{3. Bài tập Điền từ Khuyết (Cloze Listening Drill)}}",
         r"\begin{enumerate}[label=\textbf{Câu \arabic*:}, leftmargin=*, itemsep=8pt]"
     ])
 
     answer_keys = []
-    for idx, v in enumerate(data["vocabularies"], 1):
+    for idx, v in enumerate(data.get("vocabularies", []), 1):
         masked = re.sub(
             re.escape(v["term"]),
             r"\\underline{\\hspace{3cm}}",
@@ -293,19 +378,61 @@ def generate_latex_document(data: dict, full_document: bool = True) -> str:
         body_lines.append(f"    \\item ``{masked_escaped}'' \\hfill \\textit{{(Gợi ý: {meaning})}}")
         answer_keys.append(f"\\textbf{{Câu {idx}:}} {escape_latex(v['term'])}")
 
+    body_lines.append(r"\end{enumerate}")
+
+    # Thêm phần Kịch bản Hội thoại nếu có
+    if data.get("roleplay_dialogue"):
+        scenario = escape_latex(data.get("roleplay_scenario", ""))
+        body_lines.extend([
+            "",
+            f"{subsec_cmd}{{4. Luyện tập Hội thoại Sư phạm (Classroom Role-play Dialogue)}}",
+            f"\\textit{{Bối cảnh: {scenario}}}",
+            r"\begin{itemize}[leftmargin=*, itemsep=6pt]"
+        ])
+        for turn_idx, turn in enumerate(data["roleplay_dialogue"], 1):
+            st_en = escape_latex(turn["student_line"])
+            st_vi = escape_latex(turn["student_vi"])
+            tc_en = escape_latex(turn["teacher_line"])
+            tc_vi = escape_latex(turn["teacher_vi"])
+            body_lines.append(f"    \\item \\textbf{{[Lượt {turn_idx} - Học sinh]:}} ``{st_en}'' \\textit{{({st_vi})}}\\\\")
+            body_lines.append(f"    \\textbf{{[Giáo viên trả lời]:}} ``\\textbf{{{tc_en}}}'' \\textit{{({tc_vi})}}")
+        body_lines.append(r"\end{itemize}")
+
+    # Thêm phần Tình huống & Script Giảng mẫu
     body_lines.extend([
-        r"\end{enumerate}",
         "",
-        r"\section*{4. Tình huống Thực hành Giảng bài (Teach-back Challenge)}",
+        f"{subsec_cmd}{{5. Tình huống & Script Giảng mẫu (Teach-back Challenge \\& Sample Scripts)}}",
         r"\begin{tcolorbox}[colback=green!5!white,colframe=green!60!black,title=\textbf{THỬ THÁCH SƯ PHẠM (PEDAGOGICAL SCENARIO)}]",
         f"{practice_prompt}",
-        r"\end{tcolorbox}",
+        r"\end{tcolorbox}"
+    ])
+
+    if data.get("sample_teaching_scripts"):
+        body_lines.append(r"\begin{enumerate}[label=\textbf{Mẫu \arabic*:}, leftmargin=*, itemsep=8pt]")
+        for sc in data["sample_teaching_scripts"]:
+            st_title = escape_latex(sc["style_title"])
+            en_sc = escape_latex(sc["english_script"])
+            vi_sc = escape_latex(sc["vietnamese_translation"])
+            notes_sc = escape_latex(sc["pedagogical_notes"])
+            body_lines.append(f"    \\item \\textbf{{{st_title}}}\\\\")
+            body_lines.append(f"    \\textbf{{Script tiếng Anh:}} ``{en_sc}''\\\\")
+            body_lines.append(f"    \\textit{{Dịch nghĩa:}} {vi_sc}\\\\")
+            body_lines.append(f"    \\textit{{Điểm sáng sư phạm:}} {notes_sc}")
+        body_lines.append(r"\end{enumerate}")
+
+    body_lines.extend([
         "",
         r"\vspace{6pt}",
         r"\noindent\textbf{Đáp án phần Điền từ:} " + " \\quad|\\quad ".join(answer_keys)
     ])
 
-    body_content = "\n".join(body_lines)
+    return "\n".join(body_lines)
+
+def generate_latex_document(data: dict, full_document: bool = True) -> str:
+    custom_title = escape_latex(data.get("custom_title") or "PHIẾU HỌC TẬP TOÁN TIẾNG ANH (EMI)")
+    folder_name = escape_latex(data.get("folder_name") or "Chuyên đề EMI")
+    body_content = generate_single_lesson_latex_body(data, numbered_section=False)
+
     if not full_document:
         return body_content
 
@@ -330,6 +457,41 @@ def generate_latex_document(data: dict, full_document: bool = True) -> str:
 """
     closing = "\n\\end{document}\n"
     return preamble + body_content + closing
+
+def generate_multi_lessons_latex(lessons_data: list[dict], doc_title: str, full_document: bool = True) -> str:
+    """Xuất gộp cả Chuyên đề hoặc danh sách các bài học được chọn ra 1 file LaTeX duy nhất có Mục lục"""
+    bodies = []
+    for idx, l_data in enumerate(lessons_data):
+        bodies.append(generate_single_lesson_latex_body(l_data, numbered_section=True))
+    
+    combined_body = "\n\n\\newpage\n\n".join(bodies)
+    if not full_document:
+        return combined_body
+
+    safe_doc_title = escape_latex(doc_title)
+    preamble = f"""\\documentclass[12pt,a4paper]{{article}}
+\\usepackage[utf8]{{inputenc}}
+\\usepackage[T1,T5]{{fontenc}}
+\\usepackage[vietnamese]{{babel}}
+\\usepackage{{tipa}}
+\\usepackage{{amsmath,amssymb,amsfonts}}
+\\usepackage[margin=2cm]{{geometry}}
+\\usepackage{{enumitem}}
+\\usepackage{{xcolor}}
+\\usepackage{{tcolorbox}}
+\\usepackage[colorlinks=true,linkcolor=blue,urlcolor=blue]{{hyperref}}
+
+\\title{{\\textbf{{TÀI LIỆU BỒI DƯỠNG TOÁN TIẾNG ANH (EMI)\\\\[6pt] \\large {safe_doc_title.upper()}}}}}
+\\author{{Tổng hợp tự động từ Math EMI Coach ({len(lessons_data)} bài giảng)}}
+\\date{{\\today}}
+
+\\begin{{document}}
+\\maketitle
+\\tableofcontents
+\\newpage
+"""
+    closing = "\n\\end{document}\n"
+    return preamble + combined_body + closing
 
 # --- 6. HÀM TẠO BÀI KIỂM TRA LỘN XỘN KIỂU DUOLINGO ---
 def build_duolingo_quiz(data: dict) -> list[dict]:
@@ -520,7 +682,7 @@ def render_youtube_player(video_id: str, start_sec: int = 0, duration: int = 6, 
     """
     components.html(loop_html, height=300)
 
-# --- 8. HÀM TEXT-TO-SPEECH ĐỌC CHUẨN & ĐỌC CHẬM (ĐÃ SỬA LỖI DUPLICATE ELEMENT ID) ---
+# --- 8. HÀM TEXT-TO-SPEECH ĐỌC CHUẨN & ĐỌC CHẬM ---
 @st.cache_data(show_spinner=False)
 def generate_tts_audio(text: str, slow: bool = False) -> bytes:
     clean_for_speech = re.sub(r'[\$\\\{\}\_\^]', ' ', text)
@@ -631,7 +793,9 @@ def trigger_analysis(url_to_analyze: str, force_refresh: bool = False, custom_ti
             2. Trích xuất danh sách thuật ngữ Toán học quan trọng nhất kèm mốc thời gian bắt đầu (timestamp) và thời lượng (duration, tính bằng giây) để nghe trọn vẹn câu context_sentence đó.
             3. Trích xuất danh sách câu giao tiếp sư phạm tự nhiên (dẫn nhập, hỏi gợi mở, chốt ý, cảnh báo lỗi sai) dài khoảng 6-15 từ kèm mốc bắt đầu (timestamp) và thời lượng nói hết câu đó (duration, tính bằng giây).
             4. Ở trường phrase và context_sentence hãy giữ nguyên chữ viết thường để người học gõ chính tả.
-            5. Đưa ra 1 tình huống thực tế yêu cầu giáo viên giảng lại một khái niệm trong bài bằng tiếng Anh.
+            5. Đưa ra 1 tình huống thực tế (practice_prompt) yêu cầu giáo viên giảng lại một khái niệm trong bài bằng tiếng Anh.
+            6. Thiết kế 1 kịch bản Hội thoại Sư phạm (roleplay_scenario và roleplay_dialogue gồm 4 lượt trao đổi qua lại giữa Học sinh hỏi/thắc mắc và Giáo viên giải thích) sử dụng các thuật ngữ Toán trong bài.
+            7. Đề xuất 3 đoạn Script giảng mẫu (sample_teaching_scripts) giải quyết tình huống practice_prompt theo 3 phong cách: (1) Cơ bản & Rõ ràng từng bước, (2) Đặt câu hỏi gợi mở Socratic, (3) Bản xứ tự nhiên giàu ngữ điệu.
             """
             
             if use_direct_video:
@@ -690,7 +854,7 @@ def evaluate_audio_with_gemini(audio_bytes: bytes, prompt_text: str) -> str:
     )
     return response.text
 
-# --- 10. TẢI DỮ LIỆU MỤC LỤC TỪ CLOUD & THANH BÊN (CỠ CHỮ IPHONE + CẤU HÌNH) ---
+# --- 10. TẢI DỮ LIỆU MỤC LỤC TỪ CLOUD & THANH BÊN ---
 history_list = []
 folders_map: dict[str, list[dict]] = {}
 all_folders: list[str] = []
@@ -751,7 +915,6 @@ with st.sidebar:
                         st.session_state["active_clip"] = None
                         st.rerun()
 
-# Áp dụng CSS phóng to cỡ chữ cho toàn bộ ứng dụng trên iPhone
 st.markdown(f"""
 <style>
     html, body, [class*="css"], .stMarkdown, .stText, p, li, label, .stAlert {{
@@ -769,7 +932,79 @@ st.markdown(f"""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 11. GIAO DIỆN CHÍNH ---
+# --- 11. HÀM HIỂN THỊ CÔNG CỤ XUẤT LATEX THEO CHUYÊN ĐỀ / CHỌN LẺ BÀI ---
+def render_batch_latex_exporter(key_suffix: str = "main"):
+    """Giao diện cho phép xuất LaTeX cả chuyên đề hoặc tích chọn các bài học tùy ý"""
+    if not history_list:
+        st.info("Chưa có bài học nào trong kho để xuất LaTeX.")
+        return
+
+    export_scope = st.radio(
+        "Chọn phạm vi xuất tài liệu LaTeX:",
+        ["📁 Xuất nguyên 1 Chuyên đề", "☑️ Tự chọn các bài học cần xuất (từ 1 hoặc nhiều chuyên đề)"],
+        key=f"lat_scope_{key_suffix}"
+    )
+
+    selected_lessons_data = []
+    doc_title = "Tài liệu Toán Tiếng Anh (EMI)"
+
+    if export_scope == "📁 Xuất nguyên 1 Chuyên đề":
+        chosen_folder = st.selectbox("Chọn Chuyên đề muốn xuất:", all_folders, key=f"lat_fld_{key_suffix}")
+        folder_items = folders_map.get(chosen_folder, [])
+        doc_title = f"Chuyên đề: {chosen_folder}"
+        
+        export_all_in_folder = st.checkbox(f"Xuất tất cả {len(folder_items)} bài trong chuyên đề '{chosen_folder}'", value=True, key=f"lat_all_{key_suffix}")
+        if export_all_in_folder:
+            selected_rows = folder_items
+        else:
+            options_map = {f"{item['_title']} ({item['video_id']})": item for item in folder_items}
+            chosen_keys = st.multiselect(
+                "Chọn các bài muốn xuất trong chuyên đề này:",
+                list(options_map.keys()),
+                default=list(options_map.keys()),
+                key=f"lat_ms_fld_{key_suffix}"
+            )
+            selected_rows = [options_map[k] for k in chosen_keys]
+    else:
+        options_map = {f"[{item['_folder']}] {item['_title']} ({item['video_id']})": item for item in history_list}
+        chosen_keys = st.multiselect(
+            "Tích chọn các bài giảng bạn muốn gộp vào file LaTeX:",
+            list(options_map.keys()),
+            default=list(options_map.keys())[:min(3, len(options_map))],
+            key=f"lat_ms_all_{key_suffix}"
+        )
+        doc_title = st.text_input("Đặt tiêu đề cho cuốn tài liệu LaTeX:", value="Tuyển tập Bài giảng Toán Tiếng Anh (EMI)", key=f"lat_custom_title_{key_suffix}")
+        selected_rows = [options_map[k] for k in chosen_keys]
+
+    for row in selected_rows:
+        a_json = row.get("analysis_json") or {}
+        a_json.setdefault("custom_title", row["_title"])
+        a_json.setdefault("folder_name", row["_folder"])
+        selected_lessons_data.append(a_json)
+
+    full_doc_batch = st.checkbox(
+        "Bao gồm khai báo đầu file (\\documentclass...\\usepackage{tipa}...\\tableofcontents) để biên dịch độc lập",
+        value=True,
+        key=f"lat_fulldoc_{key_suffix}"
+    )
+
+    if not selected_lessons_data:
+        st.warning("Vui lòng chọn ít nhất 1 bài học để tạo mã LaTeX.")
+    else:
+        batch_latex_code = generate_multi_lessons_latex(selected_lessons_data, doc_title=doc_title, full_document=full_doc_batch)
+        st.download_button(
+            label=f"📥 Tải file LaTeX gộp ({len(selected_lessons_data)} bài học) - .tex",
+            data=batch_latex_code.encode("utf-8"),
+            file_name="chuyen_de_emi_hop_nhat.tex",
+            mime="text/plain",
+            type="primary",
+            use_container_width=True,
+            key=f"lat_dl_btn_{key_suffix}"
+        )
+        with st.expander(f"👁️ Xem trước & Copy mã LaTeX ({len(selected_lessons_data)} bài học)", expanded=False):
+            st.code(batch_latex_code, language="latex")
+
+# --- 12. GIAO DIỆN CHÍNH ---
 st.title("📐 Math EMI Coach")
 
 if "last_analyzed_url" not in st.session_state:
@@ -822,6 +1057,10 @@ with st.expander("➕ Nạp & Phân tích Video YouTube mới (Công cụ thêm 
 # TRƯỜNG HỢP A: CHƯA MỞ BÀI HỌC CỤ THỂ -> HIỂN THỊ MÀN HÌNH CHÍNH (KHO CHUYÊN ĐỀ)
 # ==============================================================================
 if "analysis" not in st.session_state:
+    if history_list:
+        with st.expander("📄 Xuất LaTeX theo Chuyên đề / Chọn nhiều bài học", expanded=False):
+            render_batch_latex_exporter(key_suffix="home")
+
     st.subheader("📚 Kho Chuyên Đề & Bài Học")
     if not history_list:
         st.info("Chưa có bài học nào trong kho. Hãy mở mục **➕ Nạp & Phân tích Video YouTube mới** ở trên để tạo bài học đầu tiên!")
@@ -1000,11 +1239,16 @@ else:
                 if st.session_state.get("active_clip") == f"phrase_{idx}":
                     render_youtube_player(video_id, start_sec=max(0, p["timestamp"] - 1), duration=p_dur, autoplay=1, loop_clip=True)
 
-    # --- TAB 3: TRẠM LUYỆN PHẢN XẠ TỪNG CÂU ---
+    # --- TAB 3: TRẠM LUYỆN PHẢN XẠ (CÓ THÊM ĐOẠN HỘI THOẠI 3-5 LƯỢT QUA LẠI) ---
     with tab_drill:
         drill_mode = st.radio(
             "Chọn bài tập rèn luyện:",
-            ["1️⃣ Nghe điền từ Toán", "2️⃣ Chép chính tả câu giảng", "3️⃣ Nhại giọng (Shadowing)"],
+            [
+                "1️⃣ Nghe điền từ Toán",
+                "2️⃣ Chép chính tả câu giảng",
+                "3️⃣ Nhại giọng (Shadowing)",
+                "4️⃣ Hội thoại Sư phạm (Role-play GV - HS)"
+            ],
             horizontal=True
         )
         st.divider()
@@ -1095,6 +1339,53 @@ else:
                     """
                     feedback = evaluate_audio_with_gemini(shadow_audio.getvalue(), prompt)
                     st.markdown(feedback)
+
+        elif drill_mode == "4️⃣ Hội thoại Sư phạm (Role-play GV - HS)":
+            st.subheader("🎭 Đóng vai Hội thoại Giữa Học sinh & Giáo viên")
+            dialogue_list = data.get("roleplay_dialogue", [])
+            
+            if not dialogue_list:
+                st.info("Bài giảng này được phân tích ở phiên bản trước nên chưa có Kịch bản Hội thoại. Bấm nút bên dưới để AI tự động soạn kịch bản và lưu vĩnh viễn vào Cloud!")
+                if st.button("✨ Tạo Kịch bản Hội thoại & Script Mẫu ngay", type="primary", use_container_width=True):
+                    generate_missing_scripts_for_old_lesson(data)
+                    st.rerun()
+            else:
+                st.success(f"🎬 **Tình huống lớp học:** {data.get('roleplay_scenario', 'Giải đáp thắc mắc Toán học bằng tiếng Anh')}")
+                st.caption("💡 **Cách luyện tập:** Ở mỗi lượt, hãy bấm **🔊 Đọc chuẩn** để nghe Học sinh hỏi trước, sau đó bạn bấm **Micro** đọc lời thoại của Giáo viên (hoặc tự ứng biến theo ý mình) để AI chấm điểm phản xạ!")
+
+                for idx, turn in enumerate(dialogue_list):
+                    with st.container(border=True):
+                        st.markdown(f"#### 🔄 Lượt trao đổi {idx + 1}/{len(dialogue_list)} &nbsp; *(Từ khóa: `{turn.get('target_vocab', '')}`)*")
+                        
+                        # Phần của Học sinh (Student)
+                        st.markdown(f"🙋‍♂️ **Học sinh (Student):** *\"{turn['student_line']}\"*")
+                        st.caption(f"🇻🇳 Tạm dịch: {turn['student_vi']}")
+                        render_tts_buttons(turn["student_line"], key_prefix=f"rp_stu_{video_id}_{idx}")
+                        
+                        st.divider()
+                        
+                        # Phần của Giáo viên (Người dùng tập nói & thu âm)
+                        st.markdown(f"👨‍🏫 **Giáo viên (Bạn tập nói):** **\"{turn['teacher_line']}\"**")
+                        st.caption(f"🇻🇳 Nghĩa: {turn['teacher_vi']}")
+                        render_tts_buttons(turn["teacher_line"], key_prefix=f"rp_tea_{video_id}_{idx}")
+
+                        rp_audio = st.audio_input(f"🎙️ Thu âm câu trả lời của bạn (Lượt {idx+1}):", key=f"rp_aud_{video_id}_{idx}")
+                        if rp_audio and st.button(f"✔️ Chấm điểm phản hồi Lượt {idx+1}", key=f"rp_btn_{video_id}_{idx}", type="primary", use_container_width=True):
+                            with st.spinner("AI đang nghe câu trả lời của bạn..."):
+                                prompt = f"""
+                                Trong lớp học Toán tiếng Anh (EMI), học sinh vừa hỏi: "{turn['student_line']}".
+                                Giáo viên đang tập nói câu phản hồi mẫu: "{turn['teacher_line']}" (Từ khóa trọng tâm: {turn.get('target_vocab', '')}).
+                                Hãy nghe file thu âm của giáo viên và nhận xét ngắn gọn bằng tiếng Việt:
+                                1. **Bạn đã nói là:** (Ghi lại lời nói từ file thu âm).
+                                2. **Độ chuẩn xác & Phản xạ (Thang 100%):** Đánh giá phát âm từ khóa Toán học, ngữ điệu giải thích cho học sinh.
+                                3. **Góp ý nâng cấp:** Chỉnh sửa những từ phát âm chưa rõ hoặc gợi ý cách nhấn giọng tự nhiên hơn.
+                                """
+                                fb = evaluate_audio_with_gemini(rp_audio.getvalue(), prompt)
+                                st.markdown(fb)
+
+                if st.button("🔄 Tạo một kịch bản Hội thoại mới khác", key=f"regen_rp_{video_id}"):
+                    generate_missing_scripts_for_old_lesson(data)
+                    st.rerun()
 
     # --- TAB 4: THỬ THÁCH KIỂM TRA LỘN XỘN KIỂU DUOLINGO ---
     with tab_quiz:
@@ -1192,9 +1483,28 @@ else:
             else:
                 st.warning(f"💪 Bạn đạt **{final_pct}%** (Cần đạt tối thiểu **80%** để được gắn tích xanh ĐÃ HỌC XONG). Hãy bấm **🔄 Tạo đề trộn ngẫu nhiên mới** ở trên để thử lại nhé!")
 
-    # --- TAB 5: TỰ GIẢNG THỬ ---
+    # --- TAB 5: TỰ GIẢNG THỬ (CÓ THÊM 3 ĐOẠN SCRIPT GIẢNG MẪU ĐỂ HỌC HỎI) ---
     with tab_speak:
-        st.info(f"**Tình huống giảng bài:** {data['practice_prompt']}")
+        st.info(f"🎯 **Tình huống giảng bài:** {data['practice_prompt']}")
+        
+        st.markdown("#### 📖 Các đoạn Script Giảng mẫu gợi ý (Bấm mở để học cách diễn đạt & nghe phát âm):")
+        sample_scripts = data.get("sample_teaching_scripts", [])
+        if not sample_scripts:
+            st.warning("Bài giảng này chưa có Script mẫu. Hãy bấm nút bên dưới để AI biên soạn ngay 3 đoạn Script mẫu theo 3 phong cách sư phạm!")
+            if st.button("✨ Đề xuất 3 Script Giảng mẫu cho tình huống này", type="primary", key=f"gen_sc_{video_id}", use_container_width=True):
+                generate_missing_scripts_for_old_lesson(data)
+                st.rerun()
+        else:
+            for s_idx, sc in enumerate(sample_scripts):
+                with st.expander(f"💡 Mẫu {s_idx + 1}: {sc['style_title']}", expanded=(s_idx == 0)):
+                    st.markdown(f"**🗣️ Script tiếng Anh:**\n\n> *\"{sc['english_script']}\"*")
+                    render_tts_buttons(sc["english_script"], key_prefix=f"sample_sc_tts_{video_id}_{s_idx}")
+                    st.markdown(f"**🇻🇳 Dịch nghĩa:** {sc['vietnamese_translation']}")
+                    st.success(f"📌 **Điểm sáng sư phạm cần học hỏi:** {sc['pedagogical_notes']}")
+
+        st.divider()
+        st.markdown("#### 🎙️ Thực hành Thu âm Bài giảng của bạn:")
+        st.caption("Bạn có thể đọc theo 1 trong 3 Script mẫu ở trên hoặc tự giảng theo ý hiểu của mình:")
         audio_val = st.audio_input("Bấm Micro để thu âm bài giảng của bạn:")
         if audio_val and st.button("Chấm điểm phát âm & Sư phạm", type="primary", use_container_width=True):
             with st.spinner("AI đang chấm điểm..."):
@@ -1208,24 +1518,34 @@ else:
                 feedback = evaluate_audio_with_gemini(audio_val.getvalue(), prompt)
                 st.markdown(feedback)
 
-    # --- TAB 6: XUẤT CODE LATEX ---
+    # --- TAB 6: XUẤT CODE LATEX (ĐƠN BÀI HOẶC GỘP CẢ CHUYÊN ĐỀ) ---
     with tab_latex:
-        st.subheader("📄 Xuất Phiếu Bài Giảng & Bài Tập ra LaTeX")
-        st.success("✨ Đã tự động chuyển đổi ký tự phiên âm IPA sang lệnh `\\textipa{...}` (gói `tipa`), biên dịch không lỗi với `pdflatex` trên Overleaf & TeXstudio!")
-        full_doc_mode = st.checkbox(
-            "Bao gồm phần khai báo đầu file (\\documentclass...\\usepackage{tipa}...\\begin{document}) để biên dịch độc lập",
-            value=True
+        st.subheader("📄 Xuất Tài liệu LaTeX")
+        latex_mode = st.radio(
+            "Chọn chế độ xuất LaTeX:",
+            ["📌 Chỉ xuất Bài học đang mở này", "📚 Xuất theo Chuyên đề / Chọn nhiều bài học"],
+            horizontal=True
         )
-        latex_code = generate_latex_document(data, full_document=full_doc_mode)
-        st.download_button(
-            label="📥 Tải file .tex về máy",
-            data=latex_code.encode("utf-8"),
-            file_name=f"emi_lesson_{video_id}.tex",
-            mime="text/plain",
-            type="primary",
-            use_container_width=True
-        )
-        st.code(latex_code, language="latex")
+        st.divider()
+
+        if latex_mode == "📌 Chỉ xuất Bài học đang mở này":
+            st.success("✨ Đã tự động chuyển đổi ký tự phiên âm IPA sang lệnh `\\textipa{...}` (gói `tipa`), bao gồm cả Hội thoại & Script Giảng mẫu!")
+            full_doc_mode = st.checkbox(
+                "Bao gồm phần khai báo đầu file (\\documentclass...\\usepackage{tipa}...\\begin{document}) để biên dịch độc lập",
+                value=True
+            )
+            latex_code = generate_latex_document(data, full_document=full_doc_mode)
+            st.download_button(
+                label="📥 Tải file .tex của bài này về máy",
+                data=latex_code.encode("utf-8"),
+                file_name=f"emi_lesson_{video_id}.tex",
+                mime="text/plain",
+                type="primary",
+                use_container_width=True
+            )
+            st.code(latex_code, language="latex")
+        else:
+            render_batch_latex_exporter(key_suffix="inside_lesson")
 
     # --- TAB 7: SỔ TAY CLOUD ---
     with tab_notebook:
