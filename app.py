@@ -107,7 +107,6 @@ def update_lesson_metadata(video_id: str, new_title: str, new_folder: str):
             st.session_state["analysis"]["folder_name"] = clean_folder
 
 def mark_lesson_completed(video_id: str, score_pct: int):
-    """Lưu trạng thái ĐÃ HỌC XONG và điểm kỷ lục lên Supabase Cloud"""
     if not db:
         return
     res = db.table("lesson_history").select("analysis_json").eq("video_id", video_id).execute()
@@ -136,8 +135,7 @@ def parse_folder_and_title(row: dict) -> tuple[str, str]:
     return "Chưa phân loại", (raw_summary[:55] + "..." if len(raw_summary) > 55 else raw_summary)
 
 def render_folder_selector(label: str, existing_folders: list[str], current_val: str = "", key_prefix: str = "fld") -> str:
-    """Cho phép người dùng chọn Mục lục có sẵn hoặc tự gõ Mục lục mới"""
-    default_list = ["Đại số", "Hình học", "Giải tích", "Số học", "Thống kê & Xác suất"]
+    default_list = ["Đại số", "Hình học", "Giải tích", "Số học", "Thống kê & Xác suất", "Kỹ năng đứng lớp bằng tiếng Anh"]
     merged_folders = sorted(list(set(default_list + existing_folders)))
     if current_val and current_val not in merged_folders:
         merged_folders.insert(0, current_val)
@@ -184,7 +182,6 @@ def escape_latex(text: str) -> str:
     return "".join(escaped_parts)
 
 def ipa_to_latex(phonetic: str) -> str:
-    """Chuyển toàn bộ ký tự Unicode phiên âm IPA sang lệnh gói tipa / LaTeX chuẩn không bao giờ lỗi pdflatex"""
     if not phonetic:
         return ""
     ipa_map = {
@@ -220,7 +217,6 @@ def ipa_to_latex(phonetic: str) -> str:
     out = phonetic.strip().strip('/')
     for k, v in ipa_map.items():
         out = out.replace(k, v)
-    # Lọc bỏ các ký tự lạ ngoài bảng mã ASCII nếu còn sót để đảm bảo biên dịch 100% thành công
     out = "".join(ch if ord(ch) < 128 else "" for ch in out)
     return out
 
@@ -337,15 +333,12 @@ def generate_latex_document(data: dict, full_document: bool = True) -> str:
 
 # --- 6. HÀM TẠO BÀI KIỂM TRA LỘN XỘN KIỂU DUOLINGO ---
 def build_duolingo_quiz(data: dict) -> list[dict]:
-    """Tạo bộ câu hỏi trộn ngẫu nhiên 4 dạng thức giống Duolingo từ dữ liệu bài học"""
     vocabs = data.get("vocabularies", [])
     phrases = data.get("classroom_phrases", [])
     questions = []
 
     all_meanings = [v["meaning"] for v in vocabs]
-    all_terms = [v["term"] for v in vocabs]
 
-    # Dạng 1: Trắc nghiệm chọn nghĩa tiếng Việt của thuật ngữ Toán
     for v in vocabs:
         wrong_pool = [m for m in all_meanings if m != v["meaning"]]
         distractors = random.sample(wrong_pool, min(3, len(wrong_pool)))
@@ -360,7 +353,6 @@ def build_duolingo_quiz(data: dict) -> list[dict]:
             "explanation": f"Ngữ cảnh trong bài: *\"{v['context_sentence']}\"*"
         })
 
-    # Dạng 2: Điền thuật ngữ Toán còn thiếu vào câu thoại của giáo viên
     for v in vocabs:
         masked = re.sub(re.escape(v["term"]), " ______ ", v["context_sentence"], flags=re.IGNORECASE)
         questions.append({
@@ -372,7 +364,6 @@ def build_duolingo_quiz(data: dict) -> list[dict]:
             "explanation": f"Đáp án chuẩn: **{v['term']}**"
         })
 
-    # Dạng 3: Tình huống sư phạm -> Chọn câu giao tiếp tiếng Anh tương ứng
     all_phrase_texts = [p["phrase"] for p in phrases]
     for p in phrases:
         wrong_p = [pt for pt in all_phrase_texts if pt != p["phrase"]]
@@ -388,7 +379,6 @@ def build_duolingo_quiz(data: dict) -> list[dict]:
             "explanation": f"Câu gốc chuẩn tại giây {p['timestamp']}s: *\"{p['phrase']}\"*"
         })
 
-    # Dạng 4: Nghe âm thanh & Gõ lại câu sư phạm
     for p in random.sample(phrases, min(2, len(phrases))):
         questions.append({
             "type": "listen_type",
@@ -400,7 +390,6 @@ def build_duolingo_quiz(data: dict) -> list[dict]:
         })
 
     random.shuffle(questions)
-    # Lấy tối đa 8 câu cho mỗi lượt thi để vừa sức học trong 2-3 phút như 1 màn Duolingo
     return questions[:min(8, len(questions))]
 
 # --- 7. TRÌNH PHÁT YOUTUBE LẶP CÂU TỰ ĐỘNG ---
@@ -531,7 +520,7 @@ def render_youtube_player(video_id: str, start_sec: int = 0, duration: int = 6, 
     """
     components.html(loop_html, height=300)
 
-# --- 8. HÀM TEXT-TO-SPEECH ĐỌC CHUẨN & ĐỌC CHẬM ---
+# --- 8. HÀM TEXT-TO-SPEECH ĐỌC CHUẨN & ĐỌC CHẬM (ĐÃ SỬA LỖI DUPLICATE ELEMENT ID) ---
 @st.cache_data(show_spinner=False)
 def generate_tts_audio(text: str, slow: bool = False) -> bytes:
     clean_for_speech = re.sub(r'[\$\\\{\}\_\^]', ' ', text)
@@ -544,13 +533,27 @@ def render_tts_buttons(text: str, key_prefix: str):
     col_normal, col_slow = st.columns(2)
     with col_normal:
         if st.button("🔊 Đọc chuẩn", key=f"{key_prefix}_norm", use_container_width=True):
-            st.session_state[f"tts_{key_prefix}"] = generate_tts_audio(text, slow=False)
+            st.session_state["active_tts_key"] = key_prefix
+            st.session_state["active_tts_bytes"] = generate_tts_audio(text, slow=False)
     with col_slow:
         if st.button("🐢 Đọc chậm", key=f"{key_prefix}_slow", use_container_width=True):
-            st.session_state[f"tts_{key_prefix}"] = generate_tts_audio(text, slow=True)
+            st.session_state["active_tts_key"] = key_prefix
+            st.session_state["active_tts_bytes"] = generate_tts_audio(text, slow=True)
             
-    if f"tts_{key_prefix}" in st.session_state:
-        st.audio(st.session_state[f"tts_{key_prefix}"], format="audio/mp3", autoplay=True)
+    if st.session_state.get("active_tts_key") == key_prefix and "active_tts_bytes" in st.session_state:
+        try:
+            st.audio(
+                st.session_state["active_tts_bytes"],
+                format="audio/mp3",
+                autoplay=True,
+                key=f"audio_player_{key_prefix}"
+            )
+        except TypeError:
+            st.audio(
+                st.session_state["active_tts_bytes"],
+                format="audio/mp3",
+                autoplay=True
+            )
 
 # --- 9. HÀM XỬ LÝ PHÂN TÍCH & LƯU TRỮ SUPABASE ---
 def extract_video_id(url: str) -> str | None:
@@ -788,7 +791,7 @@ def compare_dictation(user_text: str, target_text: str) -> tuple[int, str]:
 if query_url and query_url != st.session_state["last_analyzed_url"]:
     trigger_analysis(query_url, force_refresh=False)
 
-# --- CÔNG CỤ ĐI KÈM: NẠP VIDEO YOUTUBE MỚI (THU GỌN ĐỂ ƯU TIÊN MÀN HÌNH CHÍNH) ---
+# --- CÔNG CỤ ĐI KÈM: NẠP VIDEO YOUTUBE MỚI ---
 with st.expander("➕ Nạp & Phân tích Video YouTube mới (Công cụ thêm dữ liệu)", expanded=not bool(history_list)):
     youtube_url = st.text_input("Dán link bài giảng YouTube:", value=query_url, placeholder="https://youtu.be/...")
     col_meta1, col_meta2 = st.columns(2)
@@ -826,7 +829,6 @@ if "analysis" not in st.session_state:
         total_lessons = len(history_list)
         completed_lessons = sum(1 for h in history_list if h["_completed"])
         
-        # Thanh thống kê tổng quan tiến độ học tập
         m1, m2, m3 = st.columns(3)
         m1.metric("📁 Số Chuyên đề", len(all_folders))
         m2.metric("📖 Tổng số Bài học", total_lessons)
@@ -1206,10 +1208,10 @@ else:
                 feedback = evaluate_audio_with_gemini(audio_val.getvalue(), prompt)
                 st.markdown(feedback)
 
-    # --- TAB 6: XUẤT CODE LATEX (ĐÃ FIX LỖI PHIÊN ÂM IPA BẰNG GÓI TIPA) ---
+    # --- TAB 6: XUẤT CODE LATEX ---
     with tab_latex:
         st.subheader("📄 Xuất Phiếu Bài Giảng & Bài Tập ra LaTeX")
-        st.success("✨ Đã tự động chuyển đổi ký tự phiên âm IPA sang lệnh `\\textipa{...}` (gói `tipa`), biên dịch 100% không lỗi với `pdflatex` trên Overleaf & TeXstudio!")
+        st.success("✨ Đã tự động chuyển đổi ký tự phiên âm IPA sang lệnh `\\textipa{...}` (gói `tipa`), biên dịch không lỗi với `pdflatex` trên Overleaf & TeXstudio!")
         full_doc_mode = st.checkbox(
             "Bao gồm phần khai báo đầu file (\\documentclass...\\usepackage{tipa}...\\begin{document}) để biên dịch độc lập",
             value=True
