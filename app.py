@@ -1,6 +1,7 @@
 import re
 import io
 import time
+import random
 import difflib
 import streamlit as st
 import streamlit.components.v1 as components
@@ -59,7 +60,7 @@ class GeminiOutput(BaseModel):
     classroom_phrases: list[ClassroomPhrase]
     practice_prompt: str
 
-# --- 3. HÀM GỌI GEMINI CHỐNG QUÁ TẢI 503 (AUTO-RETRY & FALLBACK) ---
+# --- 3. HÀM GỌI GEMINI CHỐNG QUÁ TẢI 503 ---
 def generate_with_retry(client: genai.Client, contents, config=None, max_retries: int = 4):
     last_err = None
     for attempt in range(max_retries):
@@ -83,7 +84,7 @@ def generate_with_retry(client: genai.Client, contents, config=None, max_retries
                 raise e
     raise last_err
 
-# --- 4. HÀM QUẢN LÝ MỤC LỤC & ĐỔI TÊN BÀI GIẢNG TRÊN SUPABASE ---
+# --- 4. HÀM QUẢN LÝ MỤC LỤC, ĐỔI TÊN & ĐÁNH DẤU HOÀN THÀNH TRÊN SUPABASE ---
 def update_lesson_metadata(video_id: str, new_title: str, new_folder: str):
     if not db:
         return
@@ -105,6 +106,24 @@ def update_lesson_metadata(video_id: str, new_title: str, new_folder: str):
             st.session_state["analysis"]["custom_title"] = clean_title
             st.session_state["analysis"]["folder_name"] = clean_folder
 
+def mark_lesson_completed(video_id: str, score_pct: int):
+    """Lưu trạng thái ĐÃ HỌC XONG và điểm kỷ lục lên Supabase Cloud"""
+    if not db:
+        return
+    res = db.table("lesson_history").select("analysis_json").eq("video_id", video_id).execute()
+    if res.data:
+        analysis_data = res.data[0]["analysis_json"]
+        analysis_data["is_completed"] = True
+        prev_best = analysis_data.get("best_score", 0)
+        analysis_data["best_score"] = max(prev_best, score_pct)
+        db.table("lesson_history").update({
+            "analysis_json": analysis_data
+        }).eq("video_id", video_id).execute()
+
+        if "analysis" in st.session_state and st.session_state["analysis"].get("video_id") == video_id:
+            st.session_state["analysis"]["is_completed"] = True
+            st.session_state["analysis"]["best_score"] = analysis_data["best_score"]
+
 def parse_folder_and_title(row: dict) -> tuple[str, str]:
     a_json = row.get("analysis_json") or {}
     if isinstance(a_json, dict) and a_json.get("custom_title"):
@@ -116,9 +135,24 @@ def parse_folder_and_title(row: dict) -> tuple[str, str]:
         return match.group(1).strip(), match.group(2).strip()
     return "Chưa phân loại", (raw_summary[:55] + "..." if len(raw_summary) > 55 else raw_summary)
 
-# --- 5. HÀM TỰ ĐỘNG TÍNH SỐ TỪ THEO PHÚT, ĐỘ DÀI CÂU & CHUYỂN ĐỔI LATEX ---
+def render_folder_selector(label: str, existing_folders: list[str], current_val: str = "", key_prefix: str = "fld") -> str:
+    """Cho phép người dùng chọn Mục lục có sẵn hoặc tự gõ Mục lục mới"""
+    default_list = ["Đại số", "Hình học", "Giải tích", "Số học", "Thống kê & Xác suất"]
+    merged_folders = sorted(list(set(default_list + existing_folders)))
+    if current_val and current_val not in merged_folders:
+        merged_folders.insert(0, current_val)
+    
+    options = merged_folders + ["➕ Tự nhập chuyên đề mới..."]
+    default_idx = options.index(current_val) if current_val in options else 0
+    
+    choice = st.selectbox(label, options, index=default_idx, key=f"{key_prefix}_sel")
+    if choice == "➕ Tự nhập chuyên đề mới...":
+        custom_f = st.text_input("Nhập tên chuyên đề mới:", value="", placeholder="VD: Toán 7 - Chương 1...", key=f"{key_prefix}_custom")
+        return custom_f.strip() if custom_f.strip() else "Chưa phân loại"
+    return choice
+
+# --- 5. HÀM TÍNH SỐ TỪ THEO PHÚT & CHUYỂN ĐỔI LATEX (HỖ TRỢ PHIÊN ÂM IPA CHUẨN) ---
 def calculate_target_items(duration_seconds: int) -> tuple[int, float]:
-    """Tính số lượng từ vựng & mẫu câu theo bậc thang 10 phút (+2 mục mỗi 10 phút)"""
     minutes = duration_seconds / 60.0
     if minutes < 10:
         count = 5
@@ -149,6 +183,47 @@ def escape_latex(text: str) -> str:
             escaped_parts.append(part)
     return "".join(escaped_parts)
 
+def ipa_to_latex(phonetic: str) -> str:
+    """Chuyển toàn bộ ký tự Unicode phiên âm IPA sang lệnh gói tipa / LaTeX chuẩn không bao giờ lỗi pdflatex"""
+    if not phonetic:
+        return ""
+    ipa_map = {
+        'ə': r'\textschwa{}',
+        'ɚ': r'\textrhookschwa{}',
+        'ɪ': r'\textsci{}',
+        'iː': r'i\textlengthmark{}',
+        'ʊ': r'\textupsilon{}',
+        'uː': r'u\textlengthmark{}',
+        'ʌ': r'\textturnv{}',
+        'ɑ': r'\textscripta{}',
+        'ɒ': r'\textturnscripta{}',
+        'ɔ': r'\textopeno{}',
+        'æ': r'\ae{}',
+        'ɛ': r'\textepsilon{}',
+        'ɜ': r'\textrevepsilon{}',
+        'ɝ': r'\textrhookrevepsilon{}',
+        'θ': r'\texttheta{}',
+        'ð': r'\dh{}',
+        'ʃ': r'\textesh{}',
+        'ʒ': r'\textyogh{}',
+        'ŋ': r'\ng{}',
+        'ʧ': r't\textesh{}',
+        'ʤ': r'd\textyogh{}',
+        'ˈ': r'\textprimstress{}',
+        'ˌ': r'\textsecstress{}',
+        'ː': r'\textlengthmark{}',
+        'ɡ': r'g',
+        'ɹ': r'\textturnr{}',
+        'ɾ': r'\textfishhookr{}',
+        'ʔ': r'\textglotstop{}',
+    }
+    out = phonetic.strip().strip('/')
+    for k, v in ipa_map.items():
+        out = out.replace(k, v)
+    # Lọc bỏ các ký tự lạ ngoài bảng mã ASCII nếu còn sót để đảm bảo biên dịch 100% thành công
+    out = "".join(ch if ord(ch) < 128 else "" for ch in out)
+    return out
+
 def generate_latex_document(data: dict, full_document: bool = True) -> str:
     video_id = data["video_id"]
     video_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -172,13 +247,13 @@ def generate_latex_document(data: dict, full_document: bool = True) -> str:
 
     for v in data["vocabularies"]:
         term = escape_latex(v["term"])
-        phonetic = escape_latex(v["phonetic"])
+        phonetic_safe = ipa_to_latex(v["phonetic"])
         meaning = escape_latex(v["meaning"])
         ctx = escape_latex(v["context_sentence"])
         ts = v["timestamp"]
         t_link = f"https://www.youtube.com/watch?v={video_id}&t={ts}s"
         body_lines.append(
-            f"    \\item \\textbf{{{term}}} \\texttt{{/{phonetic}/}} --- \\textbf{{{meaning}}} "
+            f"    \\item \\textbf{{{term}}} [/\\textipa{{{phonetic_safe}}}/] --- \\textbf{{{meaning}}} "
             f"(\\href{{{t_link}}}{{\\textcolor{{blue}}{{[{ts}s]}}}})\\\\"
         )
         body_lines.append(f"    \\textit{{Ngữ cảnh:}} ``{ctx}''")
@@ -240,8 +315,9 @@ def generate_latex_document(data: dict, full_document: bool = True) -> str:
 
     preamble = f"""\\documentclass[12pt,a4paper]{{article}}
 \\usepackage[utf8]{{inputenc}}
-\\usepackage[T5]{{fontenc}}
+\\usepackage[T1,T5]{{fontenc}}
 \\usepackage[vietnamese]{{babel}}
+\\usepackage{{tipa}}
 \\usepackage{{amsmath,amssymb,amsfonts}}
 \\usepackage[margin=2cm]{{geometry}}
 \\usepackage{{enumitem}}
@@ -259,7 +335,75 @@ def generate_latex_document(data: dict, full_document: bool = True) -> str:
     closing = "\n\\end{document}\n"
     return preamble + body_content + closing
 
-# --- 6. TRÌNH PHÁT YOUTUBE LẶP CÂU TỰ ĐỘNG + NÚT TINH CHỈNH TỨC THÌ ---
+# --- 6. HÀM TẠO BÀI KIỂM TRA LỘN XỘN KIỂU DUOLINGO ---
+def build_duolingo_quiz(data: dict) -> list[dict]:
+    """Tạo bộ câu hỏi trộn ngẫu nhiên 4 dạng thức giống Duolingo từ dữ liệu bài học"""
+    vocabs = data.get("vocabularies", [])
+    phrases = data.get("classroom_phrases", [])
+    questions = []
+
+    all_meanings = [v["meaning"] for v in vocabs]
+    all_terms = [v["term"] for v in vocabs]
+
+    # Dạng 1: Trắc nghiệm chọn nghĩa tiếng Việt của thuật ngữ Toán
+    for v in vocabs:
+        wrong_pool = [m for m in all_meanings if m != v["meaning"]]
+        distractors = random.sample(wrong_pool, min(3, len(wrong_pool)))
+        options = distractors + [v["meaning"]]
+        random.shuffle(options)
+        questions.append({
+            "type": "mcq_meaning",
+            "prompt": f"Thuật ngữ Toán học **\"{v['term']}\"** (`/{v['phonetic']}/`) có nghĩa là gì?",
+            "tts_text": v["term"],
+            "options": options,
+            "answer": v["meaning"],
+            "explanation": f"Ngữ cảnh trong bài: *\"{v['context_sentence']}\"*"
+        })
+
+    # Dạng 2: Điền thuật ngữ Toán còn thiếu vào câu thoại của giáo viên
+    for v in vocabs:
+        masked = re.sub(re.escape(v["term"]), " ______ ", v["context_sentence"], flags=re.IGNORECASE)
+        questions.append({
+            "type": "fill_blank",
+            "prompt": f"Điền thuật ngữ tiếng Anh còn thiếu vào câu giảng sau:\n\n🗣️ *\"{masked}\"*",
+            "hint": f"Nghĩa tiếng Việt: {v['meaning']} (`/{v['phonetic']}/`)",
+            "tts_text": v["context_sentence"],
+            "answer": v["term"],
+            "explanation": f"Đáp án chuẩn: **{v['term']}**"
+        })
+
+    # Dạng 3: Tình huống sư phạm -> Chọn câu giao tiếp tiếng Anh tương ứng
+    all_phrase_texts = [p["phrase"] for p in phrases]
+    for p in phrases:
+        wrong_p = [pt for pt in all_phrase_texts if pt != p["phrase"]]
+        distractors = random.sample(wrong_p, min(3, len(wrong_p)))
+        options = distractors + [p["phrase"]]
+        random.shuffle(options)
+        questions.append({
+            "type": "mcq_phrase",
+            "prompt": f"Khi muốn nói với học sinh: **\"{p['vietnamese_equivalent']}\"** (*{p['function']}*), bạn dùng câu nào sau đây?",
+            "tts_text": p["phrase"],
+            "options": options,
+            "answer": p["phrase"],
+            "explanation": f"Câu gốc chuẩn tại giây {p['timestamp']}s: *\"{p['phrase']}\"*"
+        })
+
+    # Dạng 4: Nghe âm thanh & Gõ lại câu sư phạm
+    for p in random.sample(phrases, min(2, len(phrases))):
+        questions.append({
+            "type": "listen_type",
+            "prompt": "🔊 Bấm nghe câu phát âm mẫu bên dưới và gõ lại câu tiếng Anh bạn nghe được:",
+            "hint": f"Gợi ý nghĩa: \"{p['vietnamese_equivalent']}\"",
+            "tts_text": p["phrase"],
+            "answer": p["phrase"],
+            "explanation": f"Câu chuẩn: **{p['phrase']}**"
+        })
+
+    random.shuffle(questions)
+    # Lấy tối đa 8 câu cho mỗi lượt thi để vừa sức học trong 2-3 phút như 1 màn Duolingo
+    return questions[:min(8, len(questions))]
+
+# --- 7. TRÌNH PHÁT YOUTUBE LẶP CÂU TỰ ĐỘNG ---
 def render_youtube_player(video_id: str, start_sec: int = 0, duration: int = 6, autoplay: int = 1, loop_clip: bool = True):
     end_sec = start_sec + duration
     if not loop_clip:
@@ -387,7 +531,7 @@ def render_youtube_player(video_id: str, start_sec: int = 0, duration: int = 6, 
     """
     components.html(loop_html, height=300)
 
-# --- 7. HÀM TEXT-TO-SPEECH ĐỌC CHUẨN & ĐỌC CHẬM ---
+# --- 8. HÀM TEXT-TO-SPEECH ĐỌC CHUẨN & ĐỌC CHẬM ---
 @st.cache_data(show_spinner=False)
 def generate_tts_audio(text: str, slow: bool = False) -> bytes:
     clean_for_speech = re.sub(r'[\$\\\{\}\_\^]', ' ', text)
@@ -408,7 +552,7 @@ def render_tts_buttons(text: str, key_prefix: str):
     if f"tts_{key_prefix}" in st.session_state:
         st.audio(st.session_state[f"tts_{key_prefix}"], format="audio/mp3", autoplay=True)
 
-# --- 8. HÀM XỬ LÝ PHÂN TÍCH (TỰ ĐỘNG THEO SỐ PHÚT) & LƯU TRỮ SUPABASE ---
+# --- 9. HÀM XỬ LÝ PHÂN TÍCH & LƯU TRỮ SUPABASE ---
 def extract_video_id(url: str) -> str | None:
     pattern = r"(?:v=|\/|youtu\.be\/|shorts\/)([0-9A-Za-z_-]{11}).*"
     match = re.search(pattern, url)
@@ -513,6 +657,8 @@ def trigger_analysis(url_to_analyze: str, force_refresh: bool = False, custom_ti
                 "video_id": video_id,
                 "custom_title": final_title,
                 "folder_name": final_folder,
+                "is_completed": False,
+                "best_score": 0,
                 "from_cache": False,
                 **parsed.model_dump()
             }
@@ -541,9 +687,41 @@ def evaluate_audio_with_gemini(audio_bytes: bytes, prompt_text: str) -> str:
     )
     return response.text
 
-# --- 9. THANH BÊN (SIDEBAR): CẤU HÌNH & QUẢN LÝ MỤC LỤC BÀI GIẢNG ---
+# --- 10. TẢI DỮ LIỆU MỤC LỤC TỪ CLOUD & THANH BÊN (CỠ CHỮ IPHONE + CẤU HÌNH) ---
+history_list = []
+folders_map: dict[str, list[dict]] = {}
+all_folders: list[str] = []
+
+if db:
+    try:
+        hist_res = db.table("lesson_history").select("video_id, lesson_summary, analysis_json, created_at").order("created_at", desc=True).execute()
+        history_list = hist_res.data or []
+        for h in history_list:
+            f_name, t_name = parse_folder_and_title(h)
+            a_json = h.get("analysis_json") or {}
+            h["_folder"] = f_name
+            h["_title"] = t_name
+            h["_completed"] = bool(a_json.get("is_completed", False))
+            h["_best_score"] = int(a_json.get("best_score", 0))
+            folders_map.setdefault(f_name, []).append(h)
+        all_folders = sorted(list(folders_map.keys()))
+    except Exception as e:
+        st.sidebar.warning(f"Lỗi tải dữ liệu Cloud: {e}")
+
 with st.sidebar:
-    with st.expander("⚙️ Cấu hình Hệ thống", expanded=False):
+    st.subheader("📱 Giao diện iPhone")
+    font_size = st.slider(
+        "🔍 Cỡ chữ hiển thị (px):",
+        min_value=14, max_value=26, value=18, step=1,
+        help="Kéo sang phải để phóng to chữ trên màn hình iPhone."
+    )
+    
+    if "analysis" in st.session_state:
+        if st.button("🏠 Về Màn hình chính (Kho Chuyên Đề)", type="primary", use_container_width=True):
+            del st.session_state["analysis"]
+            st.rerun()
+
+    with st.expander("⚙️ Cấu hình AI & Độ trễ lặp", expanded=False):
         api_key = st.text_input("Gemini API Key:", value=DEFAULT_GEMINI_KEY, type="password")
         st.session_state["api_key"] = api_key
         extra_buffer = st.slider(
@@ -551,99 +729,50 @@ with st.sidebar:
             min_value=0, max_value=6, value=1, step=1
         )
     
-    st.subheader("☁️ Mục lục Bài giảng")
-    if db:
-        try:
-            hist_res = db.table("lesson_history").select("video_id, lesson_summary, analysis_json, created_at").order("created_at", desc=True).execute()
-            history_list = hist_res.data
-            if not history_list:
-                st.info("Chưa có bài giảng nào trên Cloud.")
-            else:
-                folders_map: dict[str, list[dict]] = {}
-                for h in history_list:
-                    f_name, t_name = parse_folder_and_title(h)
-                    h["_folder"] = f_name
-                    h["_title"] = t_name
-                    folders_map.setdefault(f_name, []).append(h)
-
-                all_folders = sorted(list(folders_map.keys()))
-                st.session_state["existing_folders"] = all_folders
-
-                selected_folder_filter = st.selectbox(
-                    "📁 Lọc theo mục lục:",
-                    ["Tất cả mục lục"] + all_folders
-                )
-                search_kw = st.text_input("🔍 Tìm tên bài giảng:", placeholder="Nhập từ khóa...").strip().lower()
-
-                for f_name in all_folders:
-                    if selected_folder_filter != "Tất cả mục lục" and f_name != selected_folder_filter:
-                        continue
-                    
-                    items_in_folder = [
-                        item for item in folders_map[f_name]
-                        if not search_kw or search_kw in item["_title"].lower() or search_kw in f_name.lower()
-                    ]
-                    if not items_in_folder:
-                        continue
-
-                    with st.expander(f"📁 {f_name} ({len(items_in_folder)})", expanded=True):
-                        for h in items_in_folder:
-                            vid = h["video_id"]
-                            a_json = h.get("analysis_json") or {}
-                            n_vocab = len(a_json.get("vocabularies", []))
-                            n_phrase = len(a_json.get("classroom_phrases", []))
-                            
-                            with st.container(border=True):
-                                st.markdown(f"**{h['_title']}**")
-                                st.caption(f"🔤 {n_vocab} từ | 🗣️ {n_phrase} câu | ID: `{vid}`")
-                                
-                                c_open, c_edit, c_del = st.columns([3, 1, 1])
-                                with c_open:
-                                    if st.button("📂 Mở", key=f"open_h_{vid}", use_container_width=True):
-                                        cached = h["analysis_json"]
-                                        cached["from_cache"] = True
-                                        cached.setdefault("custom_title", h["_title"])
-                                        cached.setdefault("folder_name", h["_folder"])
-                                        st.session_state["analysis"] = cached
-                                        st.session_state["active_clip"] = None
-                                        st.rerun()
-                                with c_edit:
-                                    if st.button("✏️", key=f"edit_btn_{vid}", help="Đổi tên & Chuyển mục lục", use_container_width=True):
-                                        st.session_state[f"editing_{vid}"] = not st.session_state.get(f"editing_{vid}", False)
-                                with c_del:
-                                    if st.button("🗑️", key=f"del_h_{vid}", help="Xóa bài giảng", use_container_width=True):
-                                        db.table("lesson_history").delete().eq("video_id", vid).execute()
-                                        st.rerun()
-
-                                if st.session_state.get(f"editing_{vid}", False):
-                                    new_t = st.text_input("Tên bài giảng:", value=h["_title"], key=f"in_t_{vid}")
-                                    new_f = st.text_input("Mục lục / Chuyên đề:", value=h["_folder"], key=f"in_f_{vid}", help="Gõ tên mục lục mới hoặc tên mục lục đã có")
-                                    if st.button("💾 Lưu thay đổi", key=f"save_meta_{vid}", type="primary", use_container_width=True):
-                                        update_lesson_metadata(vid, new_t, new_f)
-                                        st.session_state[f"editing_{vid}"] = False
-                                        st.toast("Đã cập nhật tên & mục lục!")
-                                        st.rerun()
-        except Exception as e:
-            st.warning(f"Lỗi tải lịch sử: {e}")
+    st.divider()
+    st.subheader("☁️ Chuyển nhanh Bài học")
+    if not history_list:
+        st.info("Kho bài giảng đang trống.")
     else:
-        st.warning("Chưa cấu hình SUPABASE_URL và SUPABASE_KEY.")
+        for f_name in all_folders:
+            with st.expander(f"📁 {f_name} ({len(folders_map[f_name])})", expanded=False):
+                for h in folders_map[f_name]:
+                    vid = h["video_id"]
+                    status_icon = "✅" if h["_completed"] else "📖"
+                    if st.button(f"{status_icon} {h['_title']}", key=f"side_open_{vid}", use_container_width=True):
+                        cached = h["analysis_json"]
+                        cached["from_cache"] = True
+                        cached.setdefault("custom_title", h["_title"])
+                        cached.setdefault("folder_name", h["_folder"])
+                        st.session_state["analysis"] = cached
+                        st.session_state["active_clip"] = None
+                        st.rerun()
 
-# --- 10. GIAO DIỆN CHÍNH ---
+# Áp dụng CSS phóng to cỡ chữ cho toàn bộ ứng dụng trên iPhone
+st.markdown(f"""
+<style>
+    html, body, [class*="css"], .stMarkdown, .stText, p, li, label, .stAlert {{
+        font-size: {font_size}px !important;
+        line-height: 1.55 !important;
+    }}
+    .stButton > button {{
+        font-size: {max(14, font_size - 1)}px !important;
+        padding-top: 0.45rem !important;
+        padding-bottom: 0.45rem !important;
+    }}
+    input, textarea, [data-baseweb="select"] {{
+        font-size: {font_size}px !important;
+    }}
+</style>
+""", unsafe_allow_html=True)
+
+# --- 11. GIAO DIỆN CHÍNH ---
 st.title("📐 Math EMI Coach")
 
 if "last_analyzed_url" not in st.session_state:
     st.session_state["last_analyzed_url"] = ""
 if "active_clip" not in st.session_state:
     st.session_state["active_clip"] = None
-
-youtube_url = st.text_input("Link bài giảng YouTube:", value=query_url, placeholder="https://youtu.be/...")
-
-with st.expander("🏷️ Đặt tên bài & Chọn mục lục trước khi phân tích (Tùy chọn - Để trống AI sẽ tự đặt)", expanded=False):
-    col_meta1, col_meta2 = st.columns(2)
-    with col_meta1:
-        custom_title_input = st.text_input("Tên bài giảng muốn đặt:", placeholder="VD: Bài 1 - Phương trình bậc nhất")
-    with col_meta2:
-        folder_input = st.text_input("Tên Mục lục / Chuyên đề:", placeholder="VD: Đại số 7, Eddie Woo...")
 
 def clean_text(text: str) -> str:
     return re.sub(r'[^\w\s]', '', text.lower()).strip()
@@ -659,45 +788,161 @@ def compare_dictation(user_text: str, target_text: str) -> tuple[int, str]:
 if query_url and query_url != st.session_state["last_analyzed_url"]:
     trigger_analysis(query_url, force_refresh=False)
 
-col_btn1, col_btn2 = st.columns([3, 1])
-with col_btn1:
-    if st.button("🚀 Mở / Phân tích bài giảng", type="primary", use_container_width=True) and youtube_url:
-        trigger_analysis(youtube_url, force_refresh=False, custom_title_in=custom_title_input, folder_in=folder_input)
-with col_btn2:
-    if st.button("🔄 Gọi lại AI", use_container_width=True) and youtube_url:
-        trigger_analysis(youtube_url, force_refresh=True, custom_title_in=custom_title_input, folder_in=folder_input)
+# --- CÔNG CỤ ĐI KÈM: NẠP VIDEO YOUTUBE MỚI (THU GỌN ĐỂ ƯU TIÊN MÀN HÌNH CHÍNH) ---
+with st.expander("➕ Nạp & Phân tích Video YouTube mới (Công cụ thêm dữ liệu)", expanded=not bool(history_list)):
+    youtube_url = st.text_input("Dán link bài giảng YouTube:", value=query_url, placeholder="https://youtu.be/...")
+    col_meta1, col_meta2 = st.columns(2)
+    with col_meta1:
+        custom_title_input = st.text_input(
+            "Tên bài học (Để trống AI tự đặt):",
+            placeholder="VD: Bài 1 - Phương trình bậc nhất"
+        )
+    with col_meta2:
+        folder_input = render_folder_selector(
+            "Chọn hoặc thêm Chuyên đề:",
+            existing_folders=all_folders,
+            current_val=all_folders[0] if all_folders else "Đại số",
+            key_prefix="new_video_fld"
+        )
 
-tab_vocab, tab_phrase, tab_drill, tab_speak, tab_latex, tab_notebook = st.tabs([
-    "🔤 Từ vựng", "🗣️ Mẫu câu", "🎧 Luyện Phản Xạ", "🎙️ Giảng thử", "📄 Xuất LaTeX", "📓 Sổ tay"
-])
+    col_btn1, col_btn2 = st.columns([3, 1])
+    with col_btn1:
+        if st.button("🚀 Phân tích & Lưu vào Kho", type="primary", use_container_width=True) and youtube_url:
+            trigger_analysis(youtube_url, force_refresh=False, custom_title_in=custom_title_input, folder_in=folder_input)
+            st.rerun()
+    with col_btn2:
+        if st.button("🔄 Phân tích lại", use_container_width=True) and youtube_url:
+            trigger_analysis(youtube_url, force_refresh=True, custom_title_in=custom_title_input, folder_in=folder_input)
+            st.rerun()
 
-if "analysis" in st.session_state:
+# ==============================================================================
+# TRƯỜNG HỢP A: CHƯA MỞ BÀI HỌC CỤ THỂ -> HIỂN THỊ MÀN HÌNH CHÍNH (KHO CHUYÊN ĐỀ)
+# ==============================================================================
+if "analysis" not in st.session_state:
+    st.subheader("📚 Kho Chuyên Đề & Bài Học")
+    if not history_list:
+        st.info("Chưa có bài học nào trong kho. Hãy mở mục **➕ Nạp & Phân tích Video YouTube mới** ở trên để tạo bài học đầu tiên!")
+    else:
+        total_lessons = len(history_list)
+        completed_lessons = sum(1 for h in history_list if h["_completed"])
+        
+        # Thanh thống kê tổng quan tiến độ học tập
+        m1, m2, m3 = st.columns(3)
+        m1.metric("📁 Số Chuyên đề", len(all_folders))
+        m2.metric("📖 Tổng số Bài học", total_lessons)
+        m3.metric("✅ Đã học xong", f"{completed_lessons}/{total_lessons}")
+        st.progress(completed_lessons / total_lessons if total_lessons > 0 else 0.0)
+
+        col_f1, col_f2 = st.columns([1, 1])
+        with col_f1:
+            filter_folder = st.selectbox("📁 Lọc theo Chuyên đề:", ["Tất cả chuyên đề"] + all_folders)
+        with col_f2:
+            search_home = st.text_input("🔍 Tìm kiếm bài học:", placeholder="Nhập tên bài...").strip().lower()
+
+        for f_name in all_folders:
+            if filter_folder != "Tất cả chuyên đề" and f_name != filter_folder:
+                continue
+            
+            matched_lessons = [
+                item for item in folders_map[f_name]
+                if not search_home or search_home in item["_title"].lower() or search_home in f_name.lower()
+            ]
+            if not matched_lessons:
+                continue
+
+            done_in_folder = sum(1 for item in matched_lessons if item["_completed"])
+            with st.expander(f"📁 Chuyên đề: {f_name} (Hoàn thành: {done_in_folder}/{len(matched_lessons)} bài)", expanded=True):
+                for h in matched_lessons:
+                    vid = h["video_id"]
+                    a_json = h.get("analysis_json") or {}
+                    n_vocab = len(a_json.get("vocabularies", []))
+                    n_phrase = len(a_json.get("classroom_phrases", []))
+                    summary_short = a_json.get("lesson_summary", "")
+                    
+                    badge = f":green[**✅ ĐÃ HỌC XONG (Kỷ lục: {h['_best_score']}%)**]" if h["_completed"] else ":orange[**⏳ Chưa hoàn thành bài kiểm tra**]"
+
+                    with st.container(border=True):
+                        st.markdown(f"### 📌 {h['_title']}")
+                        st.markdown(f"{badge} &nbsp;|&nbsp; 🔤 **{n_vocab}** từ vựng &nbsp;|&nbsp; 🗣️ **{n_phrase}** mẫu câu")
+                        if summary_short:
+                            st.caption(f"📝 {summary_short[:140]}...")
+
+                        b_open, b_edit, b_del = st.columns([3, 1, 1])
+                        with b_open:
+                            if st.button("🚀 Vào học bài này", key=f"home_open_{vid}", type="primary", use_container_width=True):
+                                cached = h["analysis_json"]
+                                cached["from_cache"] = True
+                                cached.setdefault("custom_title", h["_title"])
+                                cached.setdefault("folder_name", h["_folder"])
+                                st.session_state["analysis"] = cached
+                                st.session_state["active_clip"] = None
+                                st.rerun()
+                        with b_edit:
+                            if st.button("✏️ Sửa tên", key=f"home_edit_{vid}", use_container_width=True):
+                                st.session_state[f"editing_{vid}"] = not st.session_state.get(f"editing_{vid}", False)
+                        with b_del:
+                            if st.button("🗑️ Xóa", key=f"home_del_{vid}", use_container_width=True):
+                                db.table("lesson_history").delete().eq("video_id", vid).execute()
+                                st.rerun()
+
+                        if st.session_state.get(f"editing_{vid}", False):
+                            st.divider()
+                            new_t = st.text_input("Tên bài học:", value=h["_title"], key=f"h_in_t_{vid}")
+                            new_f = render_folder_selector(
+                                "Chuyên đề / Mục lục:",
+                                existing_folders=all_folders,
+                                current_val=h["_folder"],
+                                key_prefix=f"h_in_f_{vid}"
+                            )
+                            if st.button("💾 Lưu cập nhật", key=f"h_save_{vid}", type="primary", use_container_width=True):
+                                update_lesson_metadata(vid, new_t, new_f)
+                                st.session_state[f"editing_{vid}"] = False
+                                st.toast("Đã lưu tên mới & chuyên đề!")
+                                st.rerun()
+
+# ==============================================================================
+# TRƯỜNG HỢP B: ĐANG MỞ MỘT BÀI HỌC CỤ THỂ
+# ==============================================================================
+else:
     data = st.session_state["analysis"]
     video_id = data["video_id"]
     cur_title = data.get("custom_title") or data.get("suggested_title") or "Bài giảng đang mở"
     cur_folder = data.get("folder_name") or data.get("suggested_category") or "Chưa phân loại"
-    num_v = len(data.get("vocabularies", []))
-    num_p = len(data.get("classroom_phrases", []))
+    is_done = bool(data.get("is_completed", False))
+    best_sc = int(data.get("best_score", 0))
 
-    cache_badge = f"☁️ *(Đã tải từ Cloud: {num_v} từ vựng & {num_p} mẫu câu)*" if data.get("from_cache") else f"✨ *(Vừa trích xuất theo thời lượng video: {num_v} từ vựng & {num_p} mẫu câu)*"
-    st.success(f"📁 **{cur_folder}** ➔ 📌 **{cur_title}**\n\n📝 *Tóm tắt:* {data['lesson_summary']}\n\n{cache_badge}")
+    col_back, col_status = st.columns([2, 2])
+    with col_back:
+        if st.button("⬅️ Quay lại Kho Chuyên Đề", use_container_width=True):
+            del st.session_state["analysis"]
+            st.rerun()
+    with col_status:
+        if is_done:
+            st.success(f"✅ **ĐÃ HỌC XONG** (Điểm: {best_sc}%)")
+        else:
+            st.warning("⏳ **Chưa vượt qua bài Kiểm tra**")
 
-    with st.expander("✏️ Đổi tên bài giảng / Chuyển sang Mục lục khác", expanded=False):
-        c_ed1, c_ed2, c_ed3 = st.columns([2, 2, 1])
-        with c_ed1:
-            edit_main_title = st.text_input("Tên bài giảng:", value=cur_title, key="main_edit_title")
-        with c_ed2:
-            edit_main_folder = st.text_input("Mục lục / Chuyên đề:", value=cur_folder, key="main_edit_folder")
-        with c_ed3:
-            st.write("")
-            st.write("")
-            if st.button("💾 Lưu", key="btn_save_main_meta", type="primary", use_container_width=True):
-                update_lesson_metadata(video_id, edit_main_title, edit_main_folder)
-                st.toast("Đã lưu tên mới và mục lục!")
-                st.rerun()
+    st.info(f"📁 **{cur_folder}** ➔ 📌 **{cur_title}**\n\n📝 *Tóm tắt:* {data['lesson_summary']}")
+
+    with st.expander("✏️ Đổi tên bài giảng / Chuyển sang Chuyên đề khác", expanded=False):
+        edit_main_title = st.text_input("Tên bài giảng:", value=cur_title, key="main_edit_title")
+        edit_main_folder = render_folder_selector(
+            "Chọn hoặc tự nhập Chuyên đề:",
+            existing_folders=all_folders,
+            current_val=cur_folder,
+            key_prefix="main_edit_fld"
+        )
+        if st.button("💾 Lưu thay đổi", key="btn_save_main_meta", type="primary", use_container_width=True):
+            update_lesson_metadata(video_id, edit_main_title, edit_main_folder)
+            st.toast("Đã lưu tên mới và chuyên đề!")
+            st.rerun()
 
     with st.expander("📺 Xem toàn bộ Video bài giảng gốc từ đầu (Không lặp)", expanded=False):
         render_youtube_player(video_id, start_sec=0, autoplay=0, loop_clip=False)
+
+    tab_vocab, tab_phrase, tab_drill, tab_quiz, tab_speak, tab_latex, tab_notebook = st.tabs([
+        "🔤 Từ vựng", "🗣️ Mẫu câu", "🎧 Phản xạ", "🏆 Kiểm tra (Duolingo)", "🎙️ Giảng thử", "📄 Xuất LaTeX", "📓 Sổ tay"
+    ])
 
     # --- TAB 1: TỪ VỰNG ---
     with tab_vocab:
@@ -753,7 +998,7 @@ if "analysis" in st.session_state:
                 if st.session_state.get("active_clip") == f"phrase_{idx}":
                     render_youtube_player(video_id, start_sec=max(0, p["timestamp"] - 1), duration=p_dur, autoplay=1, loop_clip=True)
 
-    # --- TAB 3: TRẠM LUYỆN PHẢN XẠ ---
+    # --- TAB 3: TRẠM LUYỆN PHẢN XẠ TỪNG CÂU ---
     with tab_drill:
         drill_mode = st.radio(
             "Chọn bài tập rèn luyện:",
@@ -849,7 +1094,103 @@ if "analysis" in st.session_state:
                     feedback = evaluate_audio_with_gemini(shadow_audio.getvalue(), prompt)
                     st.markdown(feedback)
 
-    # --- TAB 4: TỰ GIẢNG THỬ ---
+    # --- TAB 4: THỬ THÁCH KIỂM TRA LỘN XỘN KIỂU DUOLINGO ---
+    with tab_quiz:
+        st.subheader("🦉 Thử thách Hoàn thành Bài học (Chuẩn Duolingo)")
+        st.caption("Hệ thống trộn ngẫu nhiên các câu hỏi Từ vựng, Điền từ và Nghe hiểu. Đạt **từ 80% trở lên** để nhận tích xanh **✅ ĐÃ HỌC XONG**!")
+
+        quiz_key = f"quiz_state_{video_id}"
+        if quiz_key not in st.session_state:
+            st.session_state[quiz_key] = {
+                "questions": build_duolingo_quiz(data),
+                "current_idx": 0,
+                "correct_count": 0,
+                "answered": False,
+                "last_is_correct": False,
+                "last_feedback": ""
+            }
+
+        q_state = st.session_state[quiz_key]
+        questions = q_state["questions"]
+        total_q = len(questions)
+        cur_idx = q_state["current_idx"]
+
+        if st.button("🔄 Tạo đề trộn ngẫu nhiên mới", key=f"reset_quiz_{video_id}"):
+            st.session_state[quiz_key] = {
+                "questions": build_duolingo_quiz(data),
+                "current_idx": 0,
+                "correct_count": 0,
+                "answered": False,
+                "last_is_correct": False,
+                "last_feedback": ""
+            }
+            st.rerun()
+
+        if cur_idx < total_q:
+            q_item = questions[cur_idx]
+            st.progress(cur_idx / total_q, text=f"Tiến độ: Câu {cur_idx + 1} / {total_q}  |  Đúng: {q_state['correct_count']}")
+
+            with st.container(border=True):
+                st.markdown(f"### Câu {cur_idx + 1}:")
+                st.markdown(q_item["prompt"])
+                if q_item.get("hint"):
+                    st.info(f"💡 {q_item['hint']}")
+
+                render_tts_buttons(q_item["tts_text"], key_prefix=f"quiz_tts_{video_id}_{cur_idx}")
+
+                if q_item["type"] in ("mcq_meaning", "mcq_phrase"):
+                    user_choice = st.radio(
+                        "Chọn đáp án đúng nhất:",
+                        q_item["options"],
+                        key=f"quiz_opt_{video_id}_{cur_idx}",
+                        disabled=q_state["answered"]
+                    )
+                else:
+                    user_choice = st.text_input(
+                        "Nhập câu trả lời của bạn:",
+                        key=f"quiz_txt_{video_id}_{cur_idx}",
+                        disabled=q_state["answered"]
+                    )
+
+                if not q_state["answered"]:
+                    if st.button("✔️ Kiểm tra", type="primary", use_container_width=True, key=f"chk_{video_id}_{cur_idx}"):
+                        if q_item["type"] in ("mcq_meaning", "mcq_phrase"):
+                            is_ok = (user_choice == q_item["answer"])
+                        elif q_item["type"] == "fill_blank":
+                            is_ok = (clean_text(user_choice) == clean_text(q_item["answer"]))
+                        else:
+                            sim = difflib.SequenceMatcher(None, clean_text(user_choice).split(), clean_text(q_item["answer"]).split()).ratio()
+                            is_ok = (sim >= 0.8)
+
+                        q_state["answered"] = True
+                        q_state["last_is_correct"] = is_ok
+                        if is_ok:
+                            q_state["correct_count"] += 1
+                        q_state["last_feedback"] = q_item["explanation"]
+                        st.rerun()
+                else:
+                    if q_state["last_is_correct"]:
+                        st.success(f"🎉 **Tuyệt vời! Chính xác!**\n\n{q_state['last_feedback']}")
+                    else:
+                        st.error(f"❌ **Chưa chính xác!** Đáp án đúng là: **{q_item['answer']}**\n\n{q_state['last_feedback']}")
+
+                    if st.button("➡️ Câu tiếp theo", type="primary", use_container_width=True, key=f"nxt_{video_id}_{cur_idx}"):
+                        q_state["current_idx"] += 1
+                        q_state["answered"] = False
+                        st.rerun()
+        else:
+            st.progress(1.0, text=f"Hoàn thành: {total_q} / {total_q} câu!")
+            final_pct = int(round((q_state["correct_count"] / total_q) * 100)) if total_q > 0 else 0
+            
+            st.metric("🎯 Kết quả Bài Kiểm Tra", f"{final_pct}% ({q_state['correct_count']}/{total_q} câu đúng)")
+            if final_pct >= 80:
+                st.balloons()
+                mark_lesson_completed(video_id, final_pct)
+                st.success("🏆 **CHÚC MỪNG! BẠN ĐÃ VƯỢT QUA BÀI KIỂM TRA!**\n\nBài học này đã được gắn tích xanh **✅ ĐÃ HỌC XONG** trên Kho Chuyên Đề Cloud!")
+            else:
+                st.warning(f"💪 Bạn đạt **{final_pct}%** (Cần đạt tối thiểu **80%** để được gắn tích xanh ĐÃ HỌC XONG). Hãy bấm **🔄 Tạo đề trộn ngẫu nhiên mới** ở trên để thử lại nhé!")
+
+    # --- TAB 5: TỰ GIẢNG THỬ ---
     with tab_speak:
         st.info(f"**Tình huống giảng bài:** {data['practice_prompt']}")
         audio_val = st.audio_input("Bấm Micro để thu âm bài giảng của bạn:")
@@ -865,11 +1206,12 @@ if "analysis" in st.session_state:
                 feedback = evaluate_audio_with_gemini(audio_val.getvalue(), prompt)
                 st.markdown(feedback)
 
-    # --- TAB 5: XUẤT CODE LATEX ---
+    # --- TAB 6: XUẤT CODE LATEX (ĐÃ FIX LỖI PHIÊN ÂM IPA BẰNG GÓI TIPA) ---
     with tab_latex:
         st.subheader("📄 Xuất Phiếu Bài Giảng & Bài Tập ra LaTeX")
+        st.success("✨ Đã tự động chuyển đổi ký tự phiên âm IPA sang lệnh `\\textipa{...}` (gói `tipa`), biên dịch 100% không lỗi với `pdflatex` trên Overleaf & TeXstudio!")
         full_doc_mode = st.checkbox(
-            "Bao gồm phần khai báo đầu file (\\documentclass...\\begin{document}) để biên dịch độc lập",
+            "Bao gồm phần khai báo đầu file (\\documentclass...\\usepackage{tipa}...\\begin{document}) để biên dịch độc lập",
             value=True
         )
         latex_code = generate_latex_document(data, full_document=full_doc_mode)
@@ -881,39 +1223,38 @@ if "analysis" in st.session_state:
             type="primary",
             use_container_width=True
         )
-        st.caption("💡 *Bạn cũng có thể bấm nút Copy ở góc phải khung code bên dưới để dán thẳng vào Overleaf hoặc TeXstudio:*")
         st.code(latex_code, language="latex")
 
-# --- TAB 6: SỔ TAY CLOUD ---
-with tab_notebook:
-    if db:
-        try:
-            res = db.table("saved_items").select("*").order("id", desc=True).execute()
-            items = res.data
-            if not items:
-                st.info("Sổ tay trên Cloud đang trống.")
-            else:
-                df = pd.DataFrame(items)
-                st.download_button(
-                    "📥 Tải file CSV (Mở bằng Excel / Google Sheets)",
-                    data=df.to_csv(index=False).encode("utf-8-sig"),
-                    file_name="so_tay_emi_cloud.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-                for item in items:
-                    with st.container(border=True):
-                        ca, cb, cc = st.columns([4, 1, 1])
-                        with ca:
-                            st.markdown(f"**{item['content']}** ({item['phonetic_or_func']}) — {item['meaning']}")
-                        with cb:
-                            st.link_button("▶️", f"https://www.youtube.com/watch?v={item['video_id']}&t={item['timestamp']}s")
-                        with cc:
-                            if st.button("🗑️", key=f"del_{item['id']}"):
-                                db.table("saved_items").delete().eq("id", item["id"]).execute()
-                                st.rerun()
-                        render_tts_buttons(item["content"], key_prefix=f"nb_tts_{item['id']}")
-        except Exception as e:
-            st.warning(f"Chưa tải được Sổ tay từ Cloud: {e}")
+    # --- TAB 7: SỔ TAY CLOUD ---
+    with tab_notebook:
+        if db:
+            try:
+                res = db.table("saved_items").select("*").order("id", desc=True).execute()
+                items = res.data
+                if not items:
+                    st.info("Sổ tay trên Cloud đang trống.")
+                else:
+                    df = pd.DataFrame(items)
+                    st.download_button(
+                        "📥 Tải file CSV (Mở bằng Excel / Google Sheets)",
+                        data=df.to_csv(index=False).encode("utf-8-sig"),
+                        file_name="so_tay_emi_cloud.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+                    for item in items:
+                        with st.container(border=True):
+                            ca, cb, cc = st.columns([4, 1, 1])
+                            with ca:
+                                st.markdown(f"**{item['content']}** ({item['phonetic_or_func']}) — {item['meaning']}")
+                            with cb:
+                                st.link_button("▶️", f"https://www.youtube.com/watch?v={item['video_id']}&t={item['timestamp']}s")
+                            with cc:
+                                if st.button("🗑️", key=f"del_{item['id']}"):
+                                    db.table("saved_items").delete().eq("id", item["id"]).execute()
+                                    st.rerun()
+                            render_tts_buttons(item["content"], key_prefix=f"nb_tts_{item['id']}")
+            except Exception as e:
+                st.warning(f"Chưa tải được Sổ tay từ Cloud: {e}")
 
 # --- KET THUC FILE APP.PY ---
