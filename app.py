@@ -85,7 +85,6 @@ def generate_with_retry(client: genai.Client, contents, config=None, max_retries
 
 # --- 4. HÀM QUẢN LÝ MỤC LỤC & ĐỔI TÊN BÀI GIẢNG TRÊN SUPABASE ---
 def update_lesson_metadata(video_id: str, new_title: str, new_folder: str):
-    """Cập nhật tên bài giảng và mục lục trực tiếp vào analysis_json và lesson_summary"""
     if not db:
         return
     res = db.table("lesson_history").select("analysis_json").eq("video_id", video_id).execute()
@@ -96,7 +95,6 @@ def update_lesson_metadata(video_id: str, new_title: str, new_folder: str):
         analysis_data["custom_title"] = clean_title
         analysis_data["folder_name"] = clean_folder
         
-        # Lưu định dạng "[Mục lục] Tên bài" vào cột lesson_summary để truy vấn cực nhanh
         formatted_summary = f"[{clean_folder}] {clean_title}"
         db.table("lesson_history").update({
             "lesson_summary": formatted_summary,
@@ -108,7 +106,6 @@ def update_lesson_metadata(video_id: str, new_title: str, new_folder: str):
             st.session_state["analysis"]["folder_name"] = clean_folder
 
 def parse_folder_and_title(row: dict) -> tuple[str, str]:
-    """Tách tên Mục lục và Tên bài từ dữ liệu đã lưu"""
     a_json = row.get("analysis_json") or {}
     if isinstance(a_json, dict) and a_json.get("custom_title"):
         return a_json.get("folder_name", "Chưa phân loại"), a_json.get("custom_title")
@@ -119,7 +116,16 @@ def parse_folder_and_title(row: dict) -> tuple[str, str]:
         return match.group(1).strip(), match.group(2).strip()
     return "Chưa phân loại", (raw_summary[:55] + "..." if len(raw_summary) > 55 else raw_summary)
 
-# --- 5. HÀM TỰ ĐỘNG TÍNH ĐỘ DÀI CÂU & CHUYỂN ĐỔI LATEX ---
+# --- 5. HÀM TỰ ĐỘNG TÍNH SỐ TỪ THEO PHÚT, ĐỘ DÀI CÂU & CHUYỂN ĐỔI LATEX ---
+def calculate_target_items(duration_seconds: int) -> tuple[int, float]:
+    """Tính số lượng từ vựng & mẫu câu theo bậc thang 10 phút (+2 mục mỗi 10 phút)"""
+    minutes = duration_seconds / 60.0
+    if minutes < 10:
+        count = 5
+    else:
+        count = 5 + 2 * int(minutes // 10)
+    return min(count, 25), round(minutes, 1)
+
 def get_smart_duration(item_dict: dict, sentence_text: str, extra_buffer: int = 1) -> int:
     ai_dur = item_dict.get("duration", 0)
     if ai_dur and ai_dur >= 3:
@@ -402,7 +408,7 @@ def render_tts_buttons(text: str, key_prefix: str):
     if f"tts_{key_prefix}" in st.session_state:
         st.audio(st.session_state[f"tts_{key_prefix}"], format="audio/mp3", autoplay=True)
 
-# --- 8. HÀM XỬ LÝ PHÂN TÍCH & LƯU TRỮ SUPABASE CLOUD ---
+# --- 8. HÀM XỬ LÝ PHÂN TÍCH (TỰ ĐỘNG THEO SỐ PHÚT) & LƯU TRỮ SUPABASE ---
 def extract_video_id(url: str) -> str | None:
     pattern = r"(?:v=|\/|youtu\.be\/|shorts\/)([0-9A-Za-z_-]{11}).*"
     match = re.search(pattern, url)
@@ -432,37 +438,62 @@ def trigger_analysis(url_to_analyze: str, force_refresh: bool = False, custom_ti
         st.error("Vui lòng nhập Gemini API Key ở thanh bên trái (hoặc cấu hình trong Secrets).")
         return
 
-    with st.spinner("Đang phân tích chuyên sâu bài giảng bằng Gemini AI (1-3 phút, tự động thử lại nếu máy chủ đông)..."):
+    with st.spinner("Đang đo thời lượng video & phân tích chuyên sâu bằng Gemini AI (1-3 phút)..."):
         use_direct_video = False
         transcript_text = ""
+        video_duration_sec = 0
+
         try:
             ytt_api = YouTubeTranscriptApi()
             if hasattr(ytt_api, "fetch"):
-                t_list = ytt_api.fetch(video_id, languages=['en', 'en-US', 'en-GB'])
+                t_list = list(ytt_api.fetch(video_id, languages=['en', 'en-US', 'en-GB']))
+                if t_list:
+                    last_item = t_list[-1]
+                    video_duration_sec = int(last_item.start + last_item.duration)
                 transcript_text = "\n".join([f"[{int(i.start)}s -> {int(i.start + i.duration)}s] {i.text}" for i in t_list])
             else:
                 t_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'en-US', 'en-GB'])
+                if t_list:
+                    last_item = t_list[-1]
+                    video_duration_sec = int(last_item['start'] + last_item.get('duration', 5))
                 transcript_text = "\n".join([f"[{int(i['start'])}s -> {int(i['start'] + i.get('duration', 5))}s] {i['text']}" for i in t_list])
         except Exception:
             use_direct_video = True
 
         try:
             client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=600000))
-            base_prompt = """
+            
+            if not use_direct_video and video_duration_sec > 0:
+                target_count, est_minutes = calculate_target_items(video_duration_sec)
+                st.toast(f"⏱️ Video dài ~{est_minutes} phút ➔ Tự động trích xuất {target_count} từ vựng & {target_count} mẫu câu.")
+                count_instruction = f"Video này dài khoảng {est_minutes} phút, hãy trích xuất ĐÚNG {target_count} thuật ngữ Toán học và {target_count} câu giao tiếp sư phạm trải đều từ đầu đến cuối bài."
+            else:
+                count_instruction = """
+                Hãy kiểm tra tổng thời lượng của video này và trích xuất số lượng thuật ngữ Toán học cũng như số lượng câu giao tiếp sư phạm theo đúng quy tắc bậc thang sau (trải đều khắp video):
+                - Nếu video dưới 10 phút: trích xuất 5 thuật ngữ và 5 mẫu câu.
+                - Nếu video từ 10 đến 20 phút: trích xuất 7 thuật ngữ và 7 mẫu câu.
+                - Nếu video từ 20 đến 30 phút: trích xuất 9 thuật ngữ và 9 mẫu câu.
+                - Nếu video từ 30 đến 40 phút: trích xuất 11 thuật ngữ và 11 mẫu câu.
+                - Cứ mỗi 10 phút tăng thêm: cộng thêm 2 thuật ngữ và 2 mẫu câu (Công thức: 5 + 2 * phần_nguyên(số_phút / 10)).
+                """
+
+            base_prompt = f"""
             Bạn là chuyên gia đào tạo giáo viên Toán dạy bằng tiếng Anh (EMI). Phân tích kỹ bài giảng Toán này:
+            {count_instruction}
             1. Đặt 1 tiêu đề ngắn gọn (suggested_title, dưới 8 từ) và phân loại mục lục Toán (suggested_category, ví dụ: Đại số, Hình học, Giải tích, Số học).
-            2. Trích xuất 8-10 thuật ngữ Toán học quan trọng nhất kèm mốc thời gian bắt đầu (timestamp) và thời lượng (duration, tính bằng giây) để nghe trọn vẹn câu context_sentence đó.
-            3. Trích xuất 8-10 câu giao tiếp sư phạm tự nhiên (dẫn nhập, hỏi gợi mở, chốt ý, cảnh báo lỗi sai) dài khoảng 6-15 từ kèm mốc bắt đầu (timestamp) và thời lượng nói hết câu đó (duration, tính bằng giây).
+            2. Trích xuất danh sách thuật ngữ Toán học quan trọng nhất kèm mốc thời gian bắt đầu (timestamp) và thời lượng (duration, tính bằng giây) để nghe trọn vẹn câu context_sentence đó.
+            3. Trích xuất danh sách câu giao tiếp sư phạm tự nhiên (dẫn nhập, hỏi gợi mở, chốt ý, cảnh báo lỗi sai) dài khoảng 6-15 từ kèm mốc bắt đầu (timestamp) và thời lượng nói hết câu đó (duration, tính bằng giây).
             4. Ở trường phrase và context_sentence hãy giữ nguyên chữ viết thường để người học gõ chính tả.
             5. Đưa ra 1 tình huống thực tế yêu cầu giáo viên giảng lại một khái niệm trong bài bằng tiếng Anh.
             """
+            
             if use_direct_video:
                 contents_payload = [
                     types.Part.from_uri(file_uri=f"https://www.youtube.com/watch?v={video_id}", mime_type="video/mp4"),
                     base_prompt
                 ]
             else:
-                contents_payload = f"{base_prompt}\nTranscript:\n{transcript_text[:30000]}"
+                contents_payload = f"{base_prompt}\nTranscript:\n{transcript_text[:60000]}"
 
             response = generate_with_retry(
                 client=client,
@@ -528,7 +559,6 @@ with st.sidebar:
             if not history_list:
                 st.info("Chưa có bài giảng nào trên Cloud.")
             else:
-                # Gom nhóm bài giảng theo Mục lục (Folder)
                 folders_map: dict[str, list[dict]] = {}
                 for h in history_list:
                     f_name, t_name = parse_folder_and_title(h)
@@ -559,9 +589,13 @@ with st.sidebar:
                     with st.expander(f"📁 {f_name} ({len(items_in_folder)})", expanded=True):
                         for h in items_in_folder:
                             vid = h["video_id"]
+                            a_json = h.get("analysis_json") or {}
+                            n_vocab = len(a_json.get("vocabularies", []))
+                            n_phrase = len(a_json.get("classroom_phrases", []))
+                            
                             with st.container(border=True):
                                 st.markdown(f"**{h['_title']}**")
-                                st.caption(f"ID: `{vid}`")
+                                st.caption(f"🔤 {n_vocab} từ | 🗣️ {n_phrase} câu | ID: `{vid}`")
                                 
                                 c_open, c_edit, c_del = st.columns([3, 1, 1])
                                 with c_open:
@@ -581,7 +615,6 @@ with st.sidebar:
                                         db.table("lesson_history").delete().eq("video_id", vid).execute()
                                         st.rerun()
 
-                                # Khung sửa Tên bài & Mục lục ngay tại chỗ
                                 if st.session_state.get(f"editing_{vid}", False):
                                     new_t = st.text_input("Tên bài giảng:", value=h["_title"], key=f"in_t_{vid}")
                                     new_f = st.text_input("Mục lục / Chuyên đề:", value=h["_folder"], key=f"in_f_{vid}", help="Gõ tên mục lục mới hoặc tên mục lục đã có")
@@ -610,7 +643,6 @@ with st.expander("🏷️ Đặt tên bài & Chọn mục lục trước khi ph�
     with col_meta1:
         custom_title_input = st.text_input("Tên bài giảng muốn đặt:", placeholder="VD: Bài 1 - Phương trình bậc nhất")
     with col_meta2:
-        existing_f = st.session_state.get("existing_folders", ["Đại số", "Hình học", "Giải tích"])
         folder_input = st.text_input("Tên Mục lục / Chuyên đề:", placeholder="VD: Đại số 7, Eddie Woo...")
 
 def clean_text(text: str) -> str:
@@ -644,8 +676,10 @@ if "analysis" in st.session_state:
     video_id = data["video_id"]
     cur_title = data.get("custom_title") or data.get("suggested_title") or "Bài giảng đang mở"
     cur_folder = data.get("folder_name") or data.get("suggested_category") or "Chưa phân loại"
+    num_v = len(data.get("vocabularies", []))
+    num_p = len(data.get("classroom_phrases", []))
 
-    cache_badge = "☁️ *(Đã tải tức thì từ Supabase Cloud)*" if data.get("from_cache") else "✨ *(Vừa phân tích mới & đã lưu lên Cloud)*"
+    cache_badge = f"☁️ *(Đã tải từ Cloud: {num_v} từ vựng & {num_p} mẫu câu)*" if data.get("from_cache") else f"✨ *(Vừa trích xuất theo thời lượng video: {num_v} từ vựng & {num_p} mẫu câu)*"
     st.success(f"📁 **{cur_folder}** ➔ 📌 **{cur_title}**\n\n📝 *Tóm tắt:* {data['lesson_summary']}\n\n{cache_badge}")
 
     with st.expander("✏️ Đổi tên bài giảng / Chuyển sang Mục lục khác", expanded=False):
@@ -672,7 +706,7 @@ if "analysis" in st.session_state:
             with st.container(border=True):
                 c1, c2, c3 = st.columns([3, 1, 1])
                 with c1:
-                    st.markdown(f"**{v['term']}** `/{v['phonetic']}/` — {v['meaning']}")
+                    st.markdown(f"**{idx+1}. {v['term']}** `/{v['phonetic']}/` — {v['meaning']}")
                     st.caption(f"\"{v['context_sentence']}\" *(~{v_dur}s)*")
                 with c2:
                     if st.button(f"▶️ {v['timestamp']}s", key=f"vp_{idx}", use_container_width=True):
@@ -699,7 +733,7 @@ if "analysis" in st.session_state:
             with st.container(border=True):
                 c1, c2, c3 = st.columns([3, 1, 1])
                 with c1:
-                    st.markdown(f"**\"{p['phrase']}\"** *(~{p_dur}s)*")
+                    st.markdown(f"**{idx+1}. \"{p['phrase']}\"** *(~{p_dur}s)*")
                     st.write(f"🎯 *{p['function']}* — {p['vietnamese_equivalent']}")
                 with c2:
                     if st.button(f"▶️ {p['timestamp']}s", key=f"pp_{idx}", use_container_width=True):
@@ -775,22 +809,22 @@ if "analysis" in st.session_state:
         elif drill_mode == "3️⃣ Nhại giọng (Shadowing)":
             shadow_options = [
                 {
-                    "label": f"[Mẫu câu] {p['phrase']}",
+                    "label": f"[Mẫu câu {i+1}] {p['phrase']}",
                     "text": p["phrase"],
                     "time": p["timestamp"],
                     "dur": get_smart_duration(p, p["phrase"], extra_buffer),
                     "sub": p["vietnamese_equivalent"]
                 }
-                for p in data["classroom_phrases"]
+                for i, p in enumerate(data["classroom_phrases"])
             ] + [
                 {
-                    "label": f"[Từ vựng: {v['term']}] {v['context_sentence']}",
+                    "label": f"[Từ vựng {i+1}: {v['term']}] {v['context_sentence']}",
                     "text": v["context_sentence"],
                     "time": v["timestamp"],
                     "dur": get_smart_duration(v, v["context_sentence"], extra_buffer),
                     "sub": v["meaning"]
                 }
-                for v in data["vocabularies"]
+                for i, v in enumerate(data["vocabularies"])
             ]
 
             s_idx = st.selectbox("Chọn câu muốn luyện nhại giọng:", range(len(shadow_options)), format_func=lambda i: shadow_options[i]["label"])
