@@ -15,17 +15,18 @@ st.set_page_config(page_title="Math EMI Coach Cloud", page_icon="📐", layout="
 MODEL_NAME = "gemini-3.8-flash"
 
 # --- 1. KẾT NỐI SUPABASE & GEMINI API KEY ---
-# Tự động lấy từ Streamlit Cloud Secrets. Nếu chạy trên Laptop thì bạn có thể điền vào phần chuỗi dự phòng bên phải.
-SUPABASE_URL = st.secrets.get("SUPABASE_URL", "DÁN_SUPABASE_URL_NẾU_CHẠY_LOCAL")
-SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "DÁN_SUPABASE_KEY_NẾU_CHẠY_LOCAL")
+RAW_SUPABASE_URL = st.secrets.get("SUPABASE_URL", "https://snrwrbqhmsjjhibuwcel.supabase.co")
+# Tự động làm sạch đuôi /rest/v1/ nếu người dùng copy dư từ trang Data API
+SUPABASE_URL = re.sub(r'/rest/v1/?$', '', RAW_SUPABASE_URL.strip()).rstrip('/')
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
 DEFAULT_GEMINI_KEY = st.secrets.get("GEMINI_API_KEY", "")
 
 @st.cache_resource
 def init_supabase() -> Client | None:
-    if not SUPABASE_URL or "DÁN_" in SUPABASE_URL:
+    if not SUPABASE_URL or not SUPABASE_KEY or "DÁN_" in SUPABASE_KEY:
         return None
     try:
-        return create_client(SUPABASE_URL.strip(), SUPABASE_KEY.strip())
+        return create_client(SUPABASE_URL, SUPABASE_KEY.strip())
     except Exception as e:
         st.error(f"Lỗi kết nối Supabase: {e}")
         return None
@@ -203,13 +204,15 @@ def trigger_analysis(url_to_analyze: str, force_refresh: bool = False):
         except Exception as e:
             st.warning(f"Không kiểm tra được cache trên Supabase: {e}")
 
-    # 2. Tải phụ đề & Gọi Gemini AI
+    # 2. Tải phụ đề (Hoặc dùng chế độ Gemini xem trực tiếp Video nếu IP Cloud bị chặn)
     api_key = st.session_state.get("api_key", "").strip()
     if not api_key:
         st.error("Vui lòng nhập Gemini API Key ở thanh bên trái (hoặc cấu hình trong Secrets).")
         return
 
-    with st.spinner("Đang tải phụ đề & phân tích chuyên sâu bằng Gemini AI (1-3 phút)..."):
+    with st.spinner("Đang phân tích chuyên sâu bài giảng bằng Gemini AI (1-3 phút)..."):
+        use_direct_video = False
+        transcript_text = ""
         try:
             ytt_api = YouTubeTranscriptApi()
             if hasattr(ytt_api, "fetch"):
@@ -218,27 +221,30 @@ def trigger_analysis(url_to_analyze: str, force_refresh: bool = False):
             else:
                 t_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'en-US', 'en-GB'])
                 transcript_text = "\n".join([f"[{int(i['start'])}s] {i['text']}" for i in t_list])
-        except Exception as e:
-            st.error(
-                f"⚠️ Không lấy được phụ đề trực tiếp từ đám mây (Do YouTube chặn IP máy chủ Cloud).\n\n"
-                f"💡 **Cách xử lý:** Hãy chạy lệnh `uv run streamlit run app.py` trên Laptop ở nhà 1 lần cho link này, bài giảng sẽ tự động đồng bộ lên Supabase để bạn mở trên iPhone mãi mãi. Chi tiết: {e}"
-            )
-            return
+        except Exception:
+            # Tự động chuyển sang chế độ gửi thẳng link YouTube cho Gemini xem
+            use_direct_video = True
 
         try:
             client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=600000))
-            prompt = f"""
-            Bạn là chuyên gia đào tạo giáo viên Toán dạy bằng tiếng Anh (EMI). Phân tích kỹ transcript sau:
-            1. Trích xuất 8-10 thuật ngữ Toán học quan trọng nhất (đảm bảo context_sentence chứa nguyên văn từ đó để làm bài tập đục lỗ).
-            2. Trích xuất 8-10 câu giao tiếp sư phạm tự nhiên (dẫn nhập, hỏi gợi mở, chốt ý, cảnh báo lỗi sai) dài khoảng 6-15 từ để làm bài tập nghe chép chính tả.
-            3. Ở trường phrase và context_sentence hãy giữ nguyên chữ viết thường như phụ đề để người học gõ chính tả.
+            base_prompt = """
+            Bạn là chuyên gia đào tạo giáo viên Toán dạy bằng tiếng Anh (EMI). Phân tích kỹ bài giảng Toán này:
+            1. Trích xuất 8-10 thuật ngữ Toán học quan trọng nhất kèm mốc thời gian xuất hiện tính bằng giây (đảm bảo context_sentence chứa nguyên văn câu nói chứa từ đó để làm bài tập đục lỗ).
+            2. Trích xuất 8-10 câu giao tiếp sư phạm tự nhiên (dẫn nhập, hỏi gợi mở, chốt ý, cảnh báo lỗi sai) dài khoảng 6-15 từ kèm mốc thời gian tính bằng giây để làm bài tập nghe chép chính tả.
+            3. Ở trường phrase và context_sentence hãy giữ nguyên chữ viết thường để người học gõ chính tả.
             4. Đưa ra 1 tình huống thực tế yêu cầu giáo viên giảng lại một khái niệm trong bài bằng tiếng Anh.
-            Transcript:
-            {transcript_text[:30000]}
             """
+            if use_direct_video:
+                contents_payload = [
+                    types.Part.from_uri(file_uri=f"https://www.youtube.com/watch?v={video_id}", mime_type="video/mp4"),
+                    base_prompt
+                ]
+            else:
+                contents_payload = f"{base_prompt}\nTranscript:\n{transcript_text[:30000]}"
+
             response = client.models.generate_content(
                 model=MODEL_NAME,
-                contents=prompt,
+                contents=contents_payload,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=GeminiOutput,
