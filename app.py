@@ -14,7 +14,6 @@ from supabase import create_client, Client
 
 st.set_page_config(page_title="Math EMI Coach Cloud", page_icon="📐", layout="centered")
 
-# Danh sách các model ưu tiên (nếu model đầu bị quá tải 503 sẽ tự động thử lại và chuyển model)
 FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.5-pro"]
 
 # --- 1. KẾT NỐI SUPABASE & GEMINI API KEY ---
@@ -53,6 +52,8 @@ class ClassroomPhrase(BaseModel):
     duration: int = Field(default=0, description="Thời lượng giáo viên nói hết câu phrase này (tính bằng giây, thường từ 4 đến 12 giây)")
 
 class GeminiOutput(BaseModel):
+    suggested_title: str = Field(description="Tiêu đề ngắn gọn cho bài giảng (dưới 8 từ, tiếng Việt, ví dụ: Giải phương trình bậc nhất)")
+    suggested_category: str = Field(description="Tên mục lục/chuyên đề Toán (ví dụ: Đại số, Hình học, Giải tích, Số học)")
     lesson_summary: str
     vocabularies: list[MathVocab]
     classroom_phrases: list[ClassroomPhrase]
@@ -60,7 +61,6 @@ class GeminiOutput(BaseModel):
 
 # --- 3. HÀM GỌI GEMINI CHỐNG QUÁ TẢI 503 (AUTO-RETRY & FALLBACK) ---
 def generate_with_retry(client: genai.Client, contents, config=None, max_retries: int = 4):
-    """Tự động thử lại khi Google báo 503 UNAVAILABLE (High demand) hoặc 429"""
     last_err = None
     for attempt in range(max_retries):
         for model_name in FALLBACK_MODELS:
@@ -73,10 +73,8 @@ def generate_with_retry(client: genai.Client, contents, config=None, max_retries
             except Exception as e:
                 err_str = str(e)
                 last_err = e
-                # Nếu model dự phòng không tồn tại (404), chuyển ngay sang model kế tiếp
                 if "404" in err_str or "NOT_FOUND" in err_str:
                     continue
-                # Nếu quá tải 503 hoặc giới hạn 429, đợi một chút rồi thử lại
                 if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
                     wait_sec = (attempt + 1) * 4
                     st.toast(f"⏳ Máy chủ AI đang đông ({model_name}), tự động thử lại sau {wait_sec}s (Lần {attempt+1}/{max_retries})...")
@@ -85,7 +83,43 @@ def generate_with_retry(client: genai.Client, contents, config=None, max_retries
                 raise e
     raise last_err
 
-# --- 4. HÀM TỰ ĐỘNG TÍNH ĐỘ DÀI CÂU & CHUYỂN ĐỔI LATEX ---
+# --- 4. HÀM QUẢN LÝ MỤC LỤC & ĐỔI TÊN BÀI GIẢNG TRÊN SUPABASE ---
+def update_lesson_metadata(video_id: str, new_title: str, new_folder: str):
+    """Cập nhật tên bài giảng và mục lục trực tiếp vào analysis_json và lesson_summary"""
+    if not db:
+        return
+    res = db.table("lesson_history").select("analysis_json").eq("video_id", video_id).execute()
+    if res.data:
+        analysis_data = res.data[0]["analysis_json"]
+        clean_title = new_title.strip() or "Bài giảng chưa đặt tên"
+        clean_folder = new_folder.strip() or "Chưa phân loại"
+        analysis_data["custom_title"] = clean_title
+        analysis_data["folder_name"] = clean_folder
+        
+        # Lưu định dạng "[Mục lục] Tên bài" vào cột lesson_summary để truy vấn cực nhanh
+        formatted_summary = f"[{clean_folder}] {clean_title}"
+        db.table("lesson_history").update({
+            "lesson_summary": formatted_summary,
+            "analysis_json": analysis_data
+        }).eq("video_id", video_id).execute()
+
+        if "analysis" in st.session_state and st.session_state["analysis"].get("video_id") == video_id:
+            st.session_state["analysis"]["custom_title"] = clean_title
+            st.session_state["analysis"]["folder_name"] = clean_folder
+
+def parse_folder_and_title(row: dict) -> tuple[str, str]:
+    """Tách tên Mục lục và Tên bài từ dữ liệu đã lưu"""
+    a_json = row.get("analysis_json") or {}
+    if isinstance(a_json, dict) and a_json.get("custom_title"):
+        return a_json.get("folder_name", "Chưa phân loại"), a_json.get("custom_title")
+    
+    raw_summary = row.get("lesson_summary", "")
+    match = re.match(r'^\[(.*?)\]\s*(.*)$', raw_summary)
+    if match:
+        return match.group(1).strip(), match.group(2).strip()
+    return "Chưa phân loại", (raw_summary[:55] + "..." if len(raw_summary) > 55 else raw_summary)
+
+# --- 5. HÀM TỰ ĐỘNG TÍNH ĐỘ DÀI CÂU & CHUYỂN ĐỔI LATEX ---
 def get_smart_duration(item_dict: dict, sentence_text: str, extra_buffer: int = 1) -> int:
     ai_dur = item_dict.get("duration", 0)
     if ai_dur and ai_dur >= 3:
@@ -112,15 +146,17 @@ def escape_latex(text: str) -> str:
 def generate_latex_document(data: dict, full_document: bool = True) -> str:
     video_id = data["video_id"]
     video_url = f"https://www.youtube.com/watch?v={video_id}"
+    custom_title = escape_latex(data.get("custom_title") or "PHIẾU HỌC TẬP TOÁN TIẾNG ANH (EMI)")
+    folder_name = escape_latex(data.get("folder_name") or "Chuyên đề EMI")
     summary = escape_latex(data["lesson_summary"])
     practice_prompt = escape_latex(data["practice_prompt"])
 
     body_lines = [
         r"% ===================================================================",
-        f"% TÀI LIỆU LUYỆN GIẢNG TOÁN TIẾNG ANH (EMI) - VIDEO ID: {video_id}",
+        f"% MỤC LỤC: {folder_name} | BÀI: {custom_title} (ID: {video_id})",
         r"% ===================================================================",
-        r"\begin{tcolorbox}[colback=blue!5!white,colframe=blue!75!black,title=\textbf{TỔNG QUAN BÀI GIẢNG (LESSON SUMMARY)}]",
-        f"{summary}\\\\[4pt]",
+        f"\\begin{{tcolorbox}}[colback=blue!5!white,colframe=blue!75!black,title=\\textbf{{{folder_name.upper()} --- {custom_title.upper()}}}]",
+        f"\\textbf{{Tóm tắt nội dung:}} {summary}\\\\[4pt]",
         f"\\textbf{{Link bài giảng gốc:}} \\href{{{video_url}}}{{\\texttt{{{video_url}}}}}",
         r"\end{tcolorbox}",
         "",
@@ -196,28 +232,28 @@ def generate_latex_document(data: dict, full_document: bool = True) -> str:
     if not full_document:
         return body_content
 
-    preamble = r"""\documentclass[12pt,a4paper]{article}
-\usepackage[utf8]{inputenc}
-\usepackage[T5]{fontenc}
-\usepackage[vietnamese]{babel}
-\usepackage{amsmath,amssymb,amsfonts}
-\usepackage[margin=2cm]{geometry}
-\usepackage{enumitem}
-\usepackage{xcolor}
-\usepackage{tcolorbox}
-\usepackage[colorlinks=true,linkcolor=blue,urlcolor=blue]{hyperref}
+    preamble = f"""\\documentclass[12pt,a4paper]{{article}}
+\\usepackage[utf8]{{inputenc}}
+\\usepackage[T5]{{fontenc}}
+\\usepackage[vietnamese]{{babel}}
+\\usepackage{{amsmath,amssymb,amsfonts}}
+\\usepackage[margin=2cm]{{geometry}}
+\\usepackage{{enumitem}}
+\\usepackage{{xcolor}}
+\\usepackage{{tcolorbox}}
+\\usepackage[colorlinks=true,linkcolor=blue,urlcolor=blue]{{hyperref}}
 
-\title{\textbf{PHIẾU HỌC TẬP \& RÈN LUYỆN SƯ PHẠM TOÁN TIẾNG ANH (EMI)}}
-\author{Trích xuất tự động từ Math EMI Coach}
-\date{\today}
+\\title{{\\textbf{{{custom_title.upper()}}}}}
+\\author{{Chuyên mục: {folder_name} --- Math EMI Coach}}
+\\date{{\\today}}
 
-\begin{document}
-\maketitle
+\\begin{{document}}
+\\maketitle
 """
     closing = "\n\\end{document}\n"
     return preamble + body_content + closing
 
-# --- 5. TRÌNH PHÁT YOUTUBE LẶP CÂU TỰ ĐỘNG + NÚT TINH CHỈNH TỨC THÌ ---
+# --- 6. TRÌNH PHÁT YOUTUBE LẶP CÂU TỰ ĐỘNG + NÚT TINH CHỈNH TỨC THÌ ---
 def render_youtube_player(video_id: str, start_sec: int = 0, duration: int = 6, autoplay: int = 1, loop_clip: bool = True):
     end_sec = start_sec + duration
     if not loop_clip:
@@ -345,7 +381,7 @@ def render_youtube_player(video_id: str, start_sec: int = 0, duration: int = 6, 
     """
     components.html(loop_html, height=300)
 
-# --- 6. HÀM TEXT-TO-SPEECH ĐỌC CHUẨN & ĐỌC CHẬM ---
+# --- 7. HÀM TEXT-TO-SPEECH ĐỌC CHUẨN & ĐỌC CHẬM ---
 @st.cache_data(show_spinner=False)
 def generate_tts_audio(text: str, slow: bool = False) -> bytes:
     clean_for_speech = re.sub(r'[\$\\\{\}\_\^]', ' ', text)
@@ -366,13 +402,13 @@ def render_tts_buttons(text: str, key_prefix: str):
     if f"tts_{key_prefix}" in st.session_state:
         st.audio(st.session_state[f"tts_{key_prefix}"], format="audio/mp3", autoplay=True)
 
-# --- 7. HÀM XỬ LÝ PHÂN TÍCH & LƯU TRỮ SUPABASE CLOUD ---
+# --- 8. HÀM XỬ LÝ PHÂN TÍCH & LƯU TRỮ SUPABASE CLOUD ---
 def extract_video_id(url: str) -> str | None:
     pattern = r"(?:v=|\/|youtu\.be\/|shorts\/)([0-9A-Za-z_-]{11}).*"
     match = re.search(pattern, url)
     return match.group(1) if match else None
 
-def trigger_analysis(url_to_analyze: str, force_refresh: bool = False):
+def trigger_analysis(url_to_analyze: str, force_refresh: bool = False, custom_title_in: str = "", folder_in: str = ""):
     video_id = extract_video_id(url_to_analyze)
     if not video_id:
         st.error("Link YouTube không hợp lệ.")
@@ -414,10 +450,11 @@ def trigger_analysis(url_to_analyze: str, force_refresh: bool = False):
             client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=600000))
             base_prompt = """
             Bạn là chuyên gia đào tạo giáo viên Toán dạy bằng tiếng Anh (EMI). Phân tích kỹ bài giảng Toán này:
-            1. Trích xuất 8-10 thuật ngữ Toán học quan trọng nhất kèm mốc thời gian bắt đầu (timestamp) và thời lượng (duration, tính bằng giây) để nghe trọn vẹn câu context_sentence đó.
-            2. Trích xuất 8-10 câu giao tiếp sư phạm tự nhiên (dẫn nhập, hỏi gợi mở, chốt ý, cảnh báo lỗi sai) dài khoảng 6-15 từ kèm mốc bắt đầu (timestamp) và thời lượng nói hết câu đó (duration, tính bằng giây).
-            3. Ở trường phrase và context_sentence hãy giữ nguyên chữ viết thường để người học gõ chính tả.
-            4. Đưa ra 1 tình huống thực tế yêu cầu giáo viên giảng lại một khái niệm trong bài bằng tiếng Anh.
+            1. Đặt 1 tiêu đề ngắn gọn (suggested_title, dưới 8 từ) và phân loại mục lục Toán (suggested_category, ví dụ: Đại số, Hình học, Giải tích, Số học).
+            2. Trích xuất 8-10 thuật ngữ Toán học quan trọng nhất kèm mốc thời gian bắt đầu (timestamp) và thời lượng (duration, tính bằng giây) để nghe trọn vẹn câu context_sentence đó.
+            3. Trích xuất 8-10 câu giao tiếp sư phạm tự nhiên (dẫn nhập, hỏi gợi mở, chốt ý, cảnh báo lỗi sai) dài khoảng 6-15 từ kèm mốc bắt đầu (timestamp) và thời lượng nói hết câu đó (duration, tính bằng giây).
+            4. Ở trường phrase và context_sentence hãy giữ nguyên chữ viết thường để người học gõ chính tả.
+            5. Đưa ra 1 tình huống thực tế yêu cầu giáo viên giảng lại một khái niệm trong bài bằng tiếng Anh.
             """
             if use_direct_video:
                 contents_payload = [
@@ -438,13 +475,22 @@ def trigger_analysis(url_to_analyze: str, force_refresh: bool = False):
                 max_retries=4
             )
             parsed = GeminiOutput.model_validate_json(response.text)
-            full_data = {"video_id": video_id, "from_cache": False, **parsed.model_dump()}
+            final_title = custom_title_in.strip() if custom_title_in.strip() else parsed.suggested_title
+            final_folder = folder_in.strip() if folder_in.strip() else parsed.suggested_category
+
+            full_data = {
+                "video_id": video_id,
+                "custom_title": final_title,
+                "folder_name": final_folder,
+                "from_cache": False,
+                **parsed.model_dump()
+            }
 
             if db:
                 db.table("lesson_history").upsert({
                     "video_id": video_id,
                     "youtube_url": f"https://www.youtube.com/watch?v={video_id}",
-                    "lesson_summary": parsed.lesson_summary,
+                    "lesson_summary": f"[{final_folder}] {final_title}",
                     "analysis_json": full_data
                 }).execute()
 
@@ -464,51 +510,92 @@ def evaluate_audio_with_gemini(audio_bytes: bytes, prompt_text: str) -> str:
     )
     return response.text
 
-# --- 8. THANH BÊN (SIDEBAR): CẤU HÌNH & KHO BÀI GIẢNG CLOUD ---
+# --- 9. THANH BÊN (SIDEBAR): CẤU HÌNH & QUẢN LÝ MỤC LỤC BÀI GIẢNG ---
 with st.sidebar:
-    st.header("⚙️ Cấu hình Cloud")
-    api_key = st.text_input("Gemini API Key:", value=DEFAULT_GEMINI_KEY, type="password")
-    st.session_state["api_key"] = api_key
+    with st.expander("⚙️ Cấu hình Hệ thống", expanded=False):
+        api_key = st.text_input("Gemini API Key:", value=DEFAULT_GEMINI_KEY, type="password")
+        st.session_state["api_key"] = api_key
+        extra_buffer = st.slider(
+            "⏱️ Cộng thêm giây đệm cuối câu:",
+            min_value=0, max_value=6, value=1, step=1
+        )
     
-    extra_buffer = st.slider(
-        "⏱️ Cộng thêm giây đệm cuối câu:",
-        min_value=0, max_value=6, value=1, step=1,
-        help="Độ dài mỗi câu đã được tính tự động theo số từ. Thanh này giúp cộng thêm vài giây nghỉ ở cuối câu trước khi lặp lại."
-    )
-    
-    st.divider()
-    st.subheader("☁️ Kho bài giảng trên Mây")
+    st.subheader("☁️ Mục lục Bài giảng")
     if db:
         try:
-            hist_res = db.table("lesson_history").select("video_id, lesson_summary, created_at").order("created_at", desc=True).execute()
+            hist_res = db.table("lesson_history").select("video_id, lesson_summary, analysis_json, created_at").order("created_at", desc=True).execute()
             history_list = hist_res.data
             if not history_list:
                 st.info("Chưa có bài giảng nào trên Cloud.")
             else:
+                # Gom nhóm bài giảng theo Mục lục (Folder)
+                folders_map: dict[str, list[dict]] = {}
                 for h in history_list:
-                    with st.container(border=True):
-                        st.markdown(f"**{h['lesson_summary'][:65]}...**")
-                        st.caption(f"ID: `{h['video_id']}`")
-                        c_open, c_del = st.columns([3, 1])
-                        with c_open:
-                            if st.button("📂 Mở bài", key=f"open_h_{h['video_id']}", use_container_width=True):
-                                r = db.table("lesson_history").select("analysis_json").eq("video_id", h["video_id"]).execute()
-                                if r.data:
-                                    cached = r.data[0]["analysis_json"]
-                                    cached["from_cache"] = True
-                                    st.session_state["analysis"] = cached
-                                    st.session_state["active_clip"] = None
-                                    st.rerun()
-                        with c_del:
-                            if st.button("🗑️", key=f"del_h_{h['video_id']}", use_container_width=True):
-                                db.table("lesson_history").delete().eq("video_id", h["video_id"]).execute()
-                                st.rerun()
+                    f_name, t_name = parse_folder_and_title(h)
+                    h["_folder"] = f_name
+                    h["_title"] = t_name
+                    folders_map.setdefault(f_name, []).append(h)
+
+                all_folders = sorted(list(folders_map.keys()))
+                st.session_state["existing_folders"] = all_folders
+
+                selected_folder_filter = st.selectbox(
+                    "📁 Lọc theo mục lục:",
+                    ["Tất cả mục lục"] + all_folders
+                )
+                search_kw = st.text_input("🔍 Tìm tên bài giảng:", placeholder="Nhập từ khóa...").strip().lower()
+
+                for f_name in all_folders:
+                    if selected_folder_filter != "Tất cả mục lục" and f_name != selected_folder_filter:
+                        continue
+                    
+                    items_in_folder = [
+                        item for item in folders_map[f_name]
+                        if not search_kw or search_kw in item["_title"].lower() or search_kw in f_name.lower()
+                    ]
+                    if not items_in_folder:
+                        continue
+
+                    with st.expander(f"📁 {f_name} ({len(items_in_folder)})", expanded=True):
+                        for h in items_in_folder:
+                            vid = h["video_id"]
+                            with st.container(border=True):
+                                st.markdown(f"**{h['_title']}**")
+                                st.caption(f"ID: `{vid}`")
+                                
+                                c_open, c_edit, c_del = st.columns([3, 1, 1])
+                                with c_open:
+                                    if st.button("📂 Mở", key=f"open_h_{vid}", use_container_width=True):
+                                        cached = h["analysis_json"]
+                                        cached["from_cache"] = True
+                                        cached.setdefault("custom_title", h["_title"])
+                                        cached.setdefault("folder_name", h["_folder"])
+                                        st.session_state["analysis"] = cached
+                                        st.session_state["active_clip"] = None
+                                        st.rerun()
+                                with c_edit:
+                                    if st.button("✏️", key=f"edit_btn_{vid}", help="Đổi tên & Chuyển mục lục", use_container_width=True):
+                                        st.session_state[f"editing_{vid}"] = not st.session_state.get(f"editing_{vid}", False)
+                                with c_del:
+                                    if st.button("🗑️", key=f"del_h_{vid}", help="Xóa bài giảng", use_container_width=True):
+                                        db.table("lesson_history").delete().eq("video_id", vid).execute()
+                                        st.rerun()
+
+                                # Khung sửa Tên bài & Mục lục ngay tại chỗ
+                                if st.session_state.get(f"editing_{vid}", False):
+                                    new_t = st.text_input("Tên bài giảng:", value=h["_title"], key=f"in_t_{vid}")
+                                    new_f = st.text_input("Mục lục / Chuyên đề:", value=h["_folder"], key=f"in_f_{vid}", help="Gõ tên mục lục mới hoặc tên mục lục đã có")
+                                    if st.button("💾 Lưu thay đổi", key=f"save_meta_{vid}", type="primary", use_container_width=True):
+                                        update_lesson_metadata(vid, new_t, new_f)
+                                        st.session_state[f"editing_{vid}"] = False
+                                        st.toast("Đã cập nhật tên & mục lục!")
+                                        st.rerun()
         except Exception as e:
             st.warning(f"Lỗi tải lịch sử: {e}")
     else:
         st.warning("Chưa cấu hình SUPABASE_URL và SUPABASE_KEY.")
 
-# --- 9. GIAO DIỆN CHÍNH ---
+# --- 10. GIAO DIỆN CHÍNH ---
 st.title("📐 Math EMI Coach")
 
 if "last_analyzed_url" not in st.session_state:
@@ -517,6 +604,14 @@ if "active_clip" not in st.session_state:
     st.session_state["active_clip"] = None
 
 youtube_url = st.text_input("Link bài giảng YouTube:", value=query_url, placeholder="https://youtu.be/...")
+
+with st.expander("🏷️ Đặt tên bài & Chọn mục lục trước khi phân tích (Tùy chọn - Để trống AI sẽ tự đặt)", expanded=False):
+    col_meta1, col_meta2 = st.columns(2)
+    with col_meta1:
+        custom_title_input = st.text_input("Tên bài giảng muốn đặt:", placeholder="VD: Bài 1 - Phương trình bậc nhất")
+    with col_meta2:
+        existing_f = st.session_state.get("existing_folders", ["Đại số", "Hình học", "Giải tích"])
+        folder_input = st.text_input("Tên Mục lục / Chuyên đề:", placeholder="VD: Đại số 7, Eddie Woo...")
 
 def clean_text(text: str) -> str:
     return re.sub(r'[^\w\s]', '', text.lower()).strip()
@@ -535,10 +630,10 @@ if query_url and query_url != st.session_state["last_analyzed_url"]:
 col_btn1, col_btn2 = st.columns([3, 1])
 with col_btn1:
     if st.button("🚀 Mở / Phân tích bài giảng", type="primary", use_container_width=True) and youtube_url:
-        trigger_analysis(youtube_url, force_refresh=False)
+        trigger_analysis(youtube_url, force_refresh=False, custom_title_in=custom_title_input, folder_in=folder_input)
 with col_btn2:
     if st.button("🔄 Gọi lại AI", use_container_width=True) and youtube_url:
-        trigger_analysis(youtube_url, force_refresh=True)
+        trigger_analysis(youtube_url, force_refresh=True, custom_title_in=custom_title_input, folder_in=folder_input)
 
 tab_vocab, tab_phrase, tab_drill, tab_speak, tab_latex, tab_notebook = st.tabs([
     "🔤 Từ vựng", "🗣️ Mẫu câu", "🎧 Luyện Phản Xạ", "🎙️ Giảng thử", "📄 Xuất LaTeX", "📓 Sổ tay"
@@ -547,9 +642,25 @@ tab_vocab, tab_phrase, tab_drill, tab_speak, tab_latex, tab_notebook = st.tabs([
 if "analysis" in st.session_state:
     data = st.session_state["analysis"]
     video_id = data["video_id"]
+    cur_title = data.get("custom_title") or data.get("suggested_title") or "Bài giảng đang mở"
+    cur_folder = data.get("folder_name") or data.get("suggested_category") or "Chưa phân loại"
 
-    cache_badge = "☁️ *(Đã tải tức thì từ Supabase Cloud — Không tốn API)*" if data.get("from_cache") else "✨ *(Vừa phân tích mới & đã tự động lưu lên Cloud)*"
-    st.success(f"**Chủ đề:** {data['lesson_summary']}\n\n{cache_badge}")
+    cache_badge = "☁️ *(Đã tải tức thì từ Supabase Cloud)*" if data.get("from_cache") else "✨ *(Vừa phân tích mới & đã lưu lên Cloud)*"
+    st.success(f"📁 **{cur_folder}** ➔ 📌 **{cur_title}**\n\n📝 *Tóm tắt:* {data['lesson_summary']}\n\n{cache_badge}")
+
+    with st.expander("✏️ Đổi tên bài giảng / Chuyển sang Mục lục khác", expanded=False):
+        c_ed1, c_ed2, c_ed3 = st.columns([2, 2, 1])
+        with c_ed1:
+            edit_main_title = st.text_input("Tên bài giảng:", value=cur_title, key="main_edit_title")
+        with c_ed2:
+            edit_main_folder = st.text_input("Mục lục / Chuyên đề:", value=cur_folder, key="main_edit_folder")
+        with c_ed3:
+            st.write("")
+            st.write("")
+            if st.button("💾 Lưu", key="btn_save_main_meta", type="primary", use_container_width=True):
+                update_lesson_metadata(video_id, edit_main_title, edit_main_folder)
+                st.toast("Đã lưu tên mới và mục lục!")
+                st.rerun()
 
     with st.expander("📺 Xem toàn bộ Video bài giảng gốc từ đầu (Không lặp)", expanded=False):
         render_youtube_player(video_id, start_sec=0, autoplay=0, loop_clip=False)
