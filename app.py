@@ -15,7 +15,7 @@ from supabase import create_client, Client
 
 st.set_page_config(page_title="Math EMI Coach Cloud", page_icon="📐", layout="centered")
 
-FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.5-pro"]
+FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.5-flash", "gemini-2.5-pro"]
 
 # --- 1. KẾT NỐI SUPABASE & GEMINI API KEY ---
 RAW_SUPABASE_URL = st.secrets.get("SUPABASE_URL", "https://snrwrbqhmsjjhibuwcel.supabase.co")
@@ -83,13 +83,11 @@ class GeminiOutput(BaseModel):
 
 # --- 3. BỘ ĐIỀU PHỐI XOAY VÒNG NHIỀU API KEY & MODEL DỰ PHÒNG ---
 def get_api_keys_list() -> list[str]:
-    """Tách chuỗi API Key (ngăn cách bởi dấu phẩy, chấm phẩy hoặc xuống dòng) thành danh sách các Key sạch"""
     raw_keys = st.session_state.get("api_key", "") or DEFAULT_GEMINI_KEY
     keys = [k.strip() for k in re.split(r'[,\n;]+', raw_keys) if k.strip()]
     return keys
 
 def generate_with_retry(contents, config=None, timeout_ms: int = 600000, max_retries_per_key: int = 2):
-    """Tự động xoay vòng qua danh sách API Key và các Model dự phòng khi hết quota (429) hoặc quá tải (503)"""
     api_keys = get_api_keys_list()
     if not api_keys:
         raise ValueError("Chưa có Gemini API Key nào được cấu hình.")
@@ -101,6 +99,7 @@ def generate_with_retry(contents, config=None, timeout_ms: int = 600000, max_ret
         masked_key = f"...{current_key[-4:]}" if len(current_key) > 6 else f"Key #{key_idx+1}"
         client = genai.Client(api_key=current_key, http_options=types.HttpOptions(timeout=timeout_ms))
 
+        key_exhausted = False
         for attempt in range(max_retries_per_key):
             for model_name in FALLBACK_MODELS:
                 try:
@@ -118,7 +117,8 @@ def generate_with_retry(contents, config=None, timeout_ms: int = 600000, max_ret
 
                     if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "QUOTA" in err_str.upper() or "API_KEY_INVALID" in err_str:
                         if key_idx + 1 < total_keys:
-                            st.toast(f"🔄 Key {key_idx+1}/{total_keys} ({masked_key}) chạm giới hạn trên {model_name} ➔ Đang chuyển tự động sang Key {key_idx+2}...")
+                            st.toast(f"🔄 Key {key_idx+1}/{total_keys} ({masked_key}) hết hạn mức trên {model_name} ➔ Tự động chuyển sang Key {key_idx+2}...")
+                        key_exhausted = True
                         break
 
                     if "503" in err_str or "UNAVAILABLE" in err_str:
@@ -126,11 +126,10 @@ def generate_with_retry(contents, config=None, timeout_ms: int = 600000, max_ret
                         st.toast(f"⏳ Máy chủ {model_name} đang đông, đợi {wait_sec}s rồi thử lại (Key {key_idx+1}/{total_keys})...")
                         time.sleep(wait_sec)
                         continue
-            else:
-                continue
-            break
+            if key_exhausted:
+                break
 
-    raise last_err
+    raise RuntimeError(f"Tất cả {total_keys} API Key đều đang chạm giới hạn hoặc báo lỗi. Chi tiết: {last_err}")
 
 # --- 4. HÀM QUẢN LÝ MỤC LỤC, ĐỔI TÊN & BỔ SUNG DỮ LIỆU CHO BÀI HỌC CŨ ---
 def update_lesson_metadata(video_id: str, new_title: str, new_folder: str):
@@ -171,11 +170,10 @@ def mark_lesson_completed(video_id: str, score_pct: int):
             st.session_state["analysis"]["is_completed"] = True
             st.session_state["analysis"]["best_score"] = analysis_data["best_score"]
 
-def generate_missing_scripts_for_old_lesson(data: dict):
-    """Tạo bổ sung Kịch bản Hội thoại & Script Giảng thử cho các bài học cũ đã lưu từ trước"""
+def generate_missing_scripts_for_old_lesson(data: dict) -> bool:
     if not get_api_keys_list():
         st.error("Vui lòng nhập Gemini API Key ở thanh bên trái.")
-        return
+        return False
 
     vocab_str = ", ".join([f"{v['term']} ({v['meaning']})" for v in data.get("vocabularies", [])])
     phrase_str = "; ".join([p["phrase"] for p in data.get("classroom_phrases", [])[:6]])
@@ -219,8 +217,10 @@ def generate_missing_scripts_for_old_lesson(data: dict):
                     "analysis_json": data
                 }).eq("video_id", data["video_id"]).execute()
             st.toast("✨ Đã tạo và lưu vĩnh viễn Hội thoại & Script mẫu lên Cloud!")
+            return True
         except Exception as e:
-            st.error(f"Lỗi khi tạo kịch bản: {e}")
+            st.error(f"⚠️ Lỗi khi tạo kịch bản: {e}")
+            return False
 
 def parse_folder_and_title(row: dict) -> tuple[str, str]:
     a_json = row.get("analysis_json") or {}
@@ -234,21 +234,27 @@ def parse_folder_and_title(row: dict) -> tuple[str, str]:
     return "Chưa phân loại", (raw_summary[:55] + "..." if len(raw_summary) > 55 else raw_summary)
 
 def render_folder_selector(label: str, existing_folders: list[str], current_val: str = "", key_prefix: str = "fld") -> str:
+    """Hiển thị song song ô chọn Chuyên đề có sẵn VÀ ô gõ Chuyên đề mới để không bao giờ bị đóng sập khung"""
     default_list = ["Đại số", "Hình học", "Giải tích", "Số học", "Thống kê & Xác suất", "Kỹ năng đứng lớp bằng tiếng Anh"]
     merged_folders = sorted(list(set(default_list + existing_folders)))
     if current_val and current_val not in merged_folders:
         merged_folders.insert(0, current_val)
     
-    options = merged_folders + ["➕ Tự nhập chuyên đề mới..."]
-    default_idx = options.index(current_val) if current_val in options else 0
+    default_idx = merged_folders.index(current_val) if current_val in merged_folders else 0
     
-    choice = st.selectbox(label, options, index=default_idx, key=f"{key_prefix}_sel")
-    if choice == "➕ Tự nhập chuyên đề mới...":
-        custom_f = st.text_input("Nhập tên chuyên đề mới:", value="", placeholder="VD: Toán 7 - Chương 1...", key=f"{key_prefix}_custom")
-        return custom_f.strip() if custom_f.strip() else "Chưa phân loại"
-    return choice
+    c_sel, c_new = st.columns(2)
+    with c_sel:
+        chosen_existing = st.selectbox(label, merged_folders, index=default_idx, key=f"{key_prefix}_sel")
+    with c_new:
+        typed_new = st.text_input(
+            "➕ Hoặc gõ tên Chuyên đề mới vào đây:",
+            value="",
+            placeholder="Nếu gõ vào đây sẽ ưu tiên lấy tên mới...",
+            key=f"{key_prefix}_custom"
+        )
+    return typed_new.strip() if typed_new.strip() else chosen_existing
 
-# --- 5. HÀM TÍNH SỐ TỪ THEO PHÚT & CHUYỂN ĐỔI LATEX (ĐƠN BÀI & GỘP CHUYÊN ĐỀ) ---
+# --- 5. HÀM TÍNH SỐ TỪ THEO PHÚT & CHUYỂN ĐỔI LATEX ---
 def calculate_target_items(duration_seconds: int) -> tuple[int, float]:
     minutes = duration_seconds / 60.0
     if minutes < 10:
@@ -737,17 +743,17 @@ def render_tts_buttons(text: str, key_prefix: str):
                 autoplay=True
             )
 
-# --- 9. HÀM XỬ LÝ PHÂN TÍCH & LƯU TRỮ SUPABASE ---
+# --- 9. HÀM XỬ LÝ PHÂN TÍCH & LƯU TRỮ SUPABASE (TRẢ VỀ TRUE NẾU THÀNH CÔNG) ---
 def extract_video_id(url: str) -> str | None:
     pattern = r"(?:v=|\/|youtu\.be\/|shorts\/)([0-9A-Za-z_-]{11}).*"
     match = re.search(pattern, url)
     return match.group(1) if match else None
 
-def trigger_analysis(url_to_analyze: str, force_refresh: bool = False, custom_title_in: str = "", folder_in: str = ""):
+def trigger_analysis(url_to_analyze: str, force_refresh: bool = False, custom_title_in: str = "", folder_in: str = "") -> bool:
     video_id = extract_video_id(url_to_analyze)
     if not video_id:
-        st.error("Link YouTube không hợp lệ.")
-        return
+        st.error("⚠️ Link YouTube không hợp lệ. Vui lòng kiểm tra lại đường link.")
+        return False
 
     if db and not force_refresh:
         try:
@@ -758,13 +764,13 @@ def trigger_analysis(url_to_analyze: str, force_refresh: bool = False, custom_ti
                 st.session_state["analysis"] = cached_data
                 st.session_state["active_clip"] = None
                 st.session_state["last_analyzed_url"] = url_to_analyze
-                return
+                return True
         except Exception as e:
             st.warning(f"Không kiểm tra được cache trên Supabase: {e}")
 
     if not get_api_keys_list():
-        st.error("Vui lòng nhập ít nhất 1 Gemini API Key ở thanh bên trái (hoặc cấu hình trong Secrets).")
-        return
+        st.error("⚠️ Vui lòng nhập ít nhất 1 Gemini API Key ở thanh bên trái (hoặc cấu hình trong Secrets).")
+        return False
 
     with st.spinner("Đang đo thời lượng video & phân tích chuyên sâu bằng Gemini AI (1-3 phút)..."):
         use_direct_video = False
@@ -857,8 +863,13 @@ def trigger_analysis(url_to_analyze: str, force_refresh: bool = False, custom_ti
             st.session_state["analysis"] = full_data
             st.session_state["active_clip"] = None
             st.session_state["last_analyzed_url"] = url_to_analyze
+            return True
         except Exception as e:
-            st.error(f"⚠️ Lỗi khi gọi Gemini AI: {e}")
+            st.error(
+                f"⚠️ **Không thể hoàn tất phân tích video này:**\n\n`{e}`\n\n"
+                f"💡 *Gợi ý:* Nếu thông báo có mã `429 RESOURCE_EXHAUSTED` (Hết hạn mức sau khi phân tích 5 video), bạn hãy tạo thêm 1 API Key ở một **Project mới** trên Google AI Studio rồi dán thêm vào sau dấu phẩy `,` ở mục Cấu hình bên trái nhé!"
+            )
+            return False
 
 def evaluate_audio_with_gemini(audio_bytes: bytes, prompt_text: str) -> str:
     response = generate_with_retry(
@@ -901,7 +912,7 @@ with st.sidebar:
             del st.session_state["analysis"]
             st.rerun()
 
-    with st.expander("⚙️ Cấu hình AI (Nhiều API Key) & Độ trễ lặp", expanded=False):
+    with st.expander("⚙️ Cấu hình AI (Nhiều API Key) & Độ trễ lặp", expanded=True):
         api_key = st.text_input(
             "Danh sách Gemini API Key (cách nhau bằng dấu phẩy):",
             value=DEFAULT_GEMINI_KEY,
@@ -1049,29 +1060,28 @@ if query_url and query_url != st.session_state["last_analyzed_url"]:
 # --- CÔNG CỤ ĐI KÈM: NẠP VIDEO YOUTUBE MỚI ---
 with st.expander("➕ Nạp & Phân tích Video YouTube mới (Công cụ thêm dữ liệu)", expanded=not bool(history_list)):
     youtube_url = st.text_input("Dán link bài giảng YouTube:", value=query_url, placeholder="https://youtu.be/...")
-    col_meta1, col_meta2 = st.columns(2)
-    with col_meta1:
-        custom_title_input = st.text_input(
-            "Tên bài học (Để trống AI tự đặt):",
-            placeholder="VD: Bài 1 - Phương trình bậc nhất"
-        )
-    with col_meta2:
-        folder_input = render_folder_selector(
-            "Chọn hoặc thêm Chuyên đề:",
-            existing_folders=all_folders,
-            current_val=all_folders[0] if all_folders else "Đại số",
-            key_prefix="new_video_fld"
-        )
+    custom_title_input = st.text_input(
+        "Tên bài học (Để trống AI tự đặt):",
+        placeholder="VD: Bài 1 - Phương trình bậc nhất"
+    )
+    folder_input = render_folder_selector(
+        "📁 Chọn Chuyên đề có sẵn:",
+        existing_folders=all_folders,
+        current_val=all_folders[0] if all_folders else "Đại số",
+        key_prefix="new_video_fld"
+    )
 
     col_btn1, col_btn2 = st.columns([3, 1])
     with col_btn1:
         if st.button("🚀 Phân tích & Lưu vào Kho", type="primary", use_container_width=True) and youtube_url:
-            trigger_analysis(youtube_url, force_refresh=False, custom_title_in=custom_title_input, folder_in=folder_input)
-            st.rerun()
+            ok = trigger_analysis(youtube_url, force_refresh=False, custom_title_in=custom_title_input, folder_in=folder_input)
+            if ok:
+                st.rerun()
     with col_btn2:
         if st.button("🔄 Phân tích lại", use_container_width=True) and youtube_url:
-            trigger_analysis(youtube_url, force_refresh=True, custom_title_in=custom_title_input, folder_in=folder_input)
-            st.rerun()
+            ok = trigger_analysis(youtube_url, force_refresh=True, custom_title_in=custom_title_input, folder_in=folder_input)
+            if ok:
+                st.rerun()
 
 # ==============================================================================
 # TRƯỜNG HỢP A: CHƯA MỞ BÀI HỌC CỤ THỂ -> HIỂN THỊ MÀN HÌNH CHÍNH (KHO CHUYÊN ĐỀ)
@@ -1150,7 +1160,7 @@ if "analysis" not in st.session_state:
                             st.divider()
                             new_t = st.text_input("Tên bài học:", value=h["_title"], key=f"h_in_t_{vid}")
                             new_f = render_folder_selector(
-                                "Chuyên đề / Mục lục:",
+                                "Chọn Chuyên đề có sẵn:",
                                 existing_folders=all_folders,
                                 current_val=h["_folder"],
                                 key_prefix=f"h_in_f_{vid}"
@@ -1188,7 +1198,7 @@ else:
     with st.expander("✏️ Đổi tên bài giảng / Chuyển sang Chuyên đề khác", expanded=False):
         edit_main_title = st.text_input("Tên bài giảng:", value=cur_title, key="main_edit_title")
         edit_main_folder = render_folder_selector(
-            "Chọn hoặc tự nhập Chuyên đề:",
+            "Chọn Chuyên đề có sẵn:",
             existing_folders=all_folders,
             current_val=cur_folder,
             key_prefix="main_edit_fld"
@@ -1259,7 +1269,7 @@ else:
                 if st.session_state.get("active_clip") == f"phrase_{idx}":
                     render_youtube_player(video_id, start_sec=max(0, p["timestamp"] - 1), duration=p_dur, autoplay=1, loop_clip=True)
 
-    # --- TAB 3: TRẠM LUYỆN PHẢN XẠ (CÓ THÊM ĐOẠN HỘI THOẠI 3-5 LƯỢT QUA LẠI) ---
+    # --- TAB 3: TRẠM LUYỆN PHẢN XẠ ---
     with tab_drill:
         drill_mode = st.radio(
             "Chọn bài tập rèn luyện:",
@@ -1367,8 +1377,8 @@ else:
             if not dialogue_list:
                 st.info("Bài giảng này được phân tích ở phiên bản trước nên chưa có Kịch bản Hội thoại. Bấm nút bên dưới để AI tự động soạn kịch bản và lưu vĩnh viễn vào Cloud!")
                 if st.button("✨ Tạo Kịch bản Hội thoại & Script Mẫu ngay", type="primary", use_container_width=True):
-                    generate_missing_scripts_for_old_lesson(data)
-                    st.rerun()
+                    if generate_missing_scripts_for_old_lesson(data):
+                        st.rerun()
             else:
                 st.success(f"🎬 **Tình huống lớp học:** {data.get('roleplay_scenario', 'Giải đáp thắc mắc Toán học bằng tiếng Anh')}")
                 st.caption("💡 **Cách luyện tập:** Ở mỗi lượt, hãy bấm **🔊 Đọc chuẩn** để nghe Học sinh hỏi trước, sau đó bạn bấm **Micro** đọc lời thoại của Giáo viên (hoặc tự ứng biến theo ý mình) để AI chấm điểm phản xạ!")
@@ -1402,8 +1412,8 @@ else:
                                 st.markdown(fb)
 
                 if st.button("🔄 Tạo một kịch bản Hội thoại mới khác", key=f"regen_rp_{video_id}"):
-                    generate_missing_scripts_for_old_lesson(data)
-                    st.rerun()
+                    if generate_missing_scripts_for_old_lesson(data):
+                        st.rerun()
 
     # --- TAB 4: THỬ THÁCH KIỂM TRA LỘN XỘN KIỂU DUOLINGO ---
     with tab_quiz:
@@ -1501,7 +1511,7 @@ else:
             else:
                 st.warning(f"💪 Bạn đạt **{final_pct}%** (Cần đạt tối thiểu **80%** để được gắn tích xanh ĐÃ HỌC XONG). Hãy bấm **🔄 Tạo đề trộn ngẫu nhiên mới** ở trên để thử lại nhé!")
 
-    # --- TAB 5: TỰ GIẢNG THỬ (CÓ THÊM 3 ĐOẠN SCRIPT GIẢNG MẪU ĐỂ HỌC HỎI) ---
+    # --- TAB 5: TỰ GIẢNG THỬ ---
     with tab_speak:
         st.info(f"🎯 **Tình huống giảng bài:** {data['practice_prompt']}")
         
@@ -1510,8 +1520,8 @@ else:
         if not sample_scripts:
             st.warning("Bài giảng này chưa có Script mẫu. Hãy bấm nút bên dưới để AI biên soạn ngay 3 đoạn Script mẫu theo 3 phong cách sư phạm!")
             if st.button("✨ Đề xuất 3 Script Giảng mẫu cho tình huống này", type="primary", key=f"gen_sc_{video_id}", use_container_width=True):
-                generate_missing_scripts_for_old_lesson(data)
-                st.rerun()
+                if generate_missing_scripts_for_old_lesson(data):
+                    st.rerun()
         else:
             for s_idx, sc in enumerate(sample_scripts):
                 with st.expander(f"💡 Mẫu {s_idx + 1}: {sc['style_title']}", expanded=(s_idx == 0)):
@@ -1536,7 +1546,7 @@ else:
                 feedback = evaluate_audio_with_gemini(audio_val.getvalue(), prompt)
                 st.markdown(feedback)
 
-    # --- TAB 6: XUẤT CODE LATEX (ĐƠN BÀI HOẶC GỘP CẢ CHUYÊN ĐỀ) ---
+    # --- TAB 6: XUẤT CODE LATEX ---
     with tab_latex:
         st.subheader("📄 Xuất Tài liệu LaTeX")
         latex_mode = st.radio(
