@@ -761,6 +761,24 @@ def trigger_analysis(url_to_analyze: str, force_refresh: bool = False, custom_ti
             if res.data:
                 cached_data = res.data[0]["analysis_json"]
                 cached_data["from_cache"] = True
+                
+                # Nếu người dùng có nhập Tên mới hoặc chọn Chuyên đề mới thì cập nhật luôn vào Supabase
+                if custom_title_in.strip():
+                    cached_data["custom_title"] = custom_title_in.strip()
+                if folder_in.strip():
+                    cached_data["folder_name"] = folder_in.strip()
+                
+                if custom_title_in.strip() or folder_in.strip():
+                    c_title = cached_data.get("custom_title", "Bài giảng")
+                    c_folder = cached_data.get("folder_name", "Chưa phân loại")
+                    db.table("lesson_history").update({
+                        "lesson_summary": f"[{c_folder}] {c_title}",
+                        "analysis_json": cached_data
+                    }).eq("video_id", video_id).execute()
+                    st.toast(f"⚡ Video đã có sẵn trong Kho! Đã cập nhật thành: [{c_folder}] {c_title}")
+                else:
+                    st.toast("⚡ Video đã có sẵn trong Kho! Đã mở ngay mà không tốn token AI.")
+
                 st.session_state["analysis"] = cached_data
                 st.session_state["active_clip"] = None
                 st.session_state["last_analyzed_url"] = url_to_analyze
