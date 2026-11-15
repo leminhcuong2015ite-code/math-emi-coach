@@ -81,28 +81,55 @@ class GeminiOutput(BaseModel):
     roleplay_dialogue: list[DialogueTurn] = Field(description="Đoạn hội thoại gồm 4 lượt phản hồi qua lại giữa Học sinh và Giáo viên")
     sample_teaching_scripts: list[SampleTeachingScript] = Field(description="3 đoạn script giảng mẫu theo 3 phong cách cho tình huống practice_prompt")
 
-# --- 3. HÀM GỌI GEMINI CHỐNG QUÁ TẢI 503 ---
-def generate_with_retry(client: genai.Client, contents, config=None, max_retries: int = 4):
+# --- 3. BỘ ĐIỀU PHỐI XOAY VÒNG NHIỀU API KEY & MODEL DỰ PHÒNG ---
+def get_api_keys_list() -> list[str]:
+    """Tách chuỗi API Key (ngăn cách bởi dấu phẩy, chấm phẩy hoặc xuống dòng) thành danh sách các Key sạch"""
+    raw_keys = st.session_state.get("api_key", "") or DEFAULT_GEMINI_KEY
+    keys = [k.strip() for k in re.split(r'[,\n;]+', raw_keys) if k.strip()]
+    return keys
+
+def generate_with_retry(contents, config=None, timeout_ms: int = 600000, max_retries_per_key: int = 2):
+    """Tự động xoay vòng qua danh sách API Key và các Model dự phòng khi hết quota (429) hoặc quá tải (503)"""
+    api_keys = get_api_keys_list()
+    if not api_keys:
+        raise ValueError("Chưa có Gemini API Key nào được cấu hình.")
+
     last_err = None
-    for attempt in range(max_retries):
-        for model_name in FALLBACK_MODELS:
-            try:
-                return client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=config,
-                )
-            except Exception as e:
-                err_str = str(e)
-                last_err = e
-                if "404" in err_str or "NOT_FOUND" in err_str:
-                    continue
-                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
-                    wait_sec = (attempt + 1) * 4
-                    st.toast(f"⏳ Máy chủ AI đang đông ({model_name}), tự động thử lại sau {wait_sec}s (Lần {attempt+1}/{max_retries})...")
-                    time.sleep(wait_sec)
-                    break
-                raise e
+    total_keys = len(api_keys)
+
+    for key_idx, current_key in enumerate(api_keys):
+        masked_key = f"...{current_key[-4:]}" if len(current_key) > 6 else f"Key #{key_idx+1}"
+        client = genai.Client(api_key=current_key, http_options=types.HttpOptions(timeout=timeout_ms))
+
+        for attempt in range(max_retries_per_key):
+            for model_name in FALLBACK_MODELS:
+                try:
+                    return client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=config,
+                    )
+                except Exception as e:
+                    err_str = str(e)
+                    last_err = e
+
+                    if "404" in err_str or "NOT_FOUND" in err_str:
+                        continue
+
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "QUOTA" in err_str.upper() or "API_KEY_INVALID" in err_str:
+                        if key_idx + 1 < total_keys:
+                            st.toast(f"🔄 Key {key_idx+1}/{total_keys} ({masked_key}) chạm giới hạn trên {model_name} ➔ Đang chuyển tự động sang Key {key_idx+2}...")
+                        break
+
+                    if "503" in err_str or "UNAVAILABLE" in err_str:
+                        wait_sec = (attempt + 1) * 3
+                        st.toast(f"⏳ Máy chủ {model_name} đang đông, đợi {wait_sec}s rồi thử lại (Key {key_idx+1}/{total_keys})...")
+                        time.sleep(wait_sec)
+                        continue
+            else:
+                continue
+            break
+
     raise last_err
 
 # --- 4. HÀM QUẢN LÝ MỤC LỤC, ĐỔI TÊN & BỔ SUNG DỮ LIỆU CHO BÀI HỌC CŨ ---
@@ -146,8 +173,7 @@ def mark_lesson_completed(video_id: str, score_pct: int):
 
 def generate_missing_scripts_for_old_lesson(data: dict):
     """Tạo bổ sung Kịch bản Hội thoại & Script Giảng thử cho các bài học cũ đã lưu từ trước"""
-    api_key = st.session_state.get("api_key", "").strip()
-    if not api_key:
+    if not get_api_keys_list():
         st.error("Vui lòng nhập Gemini API Key ở thanh bên trái.")
         return
 
@@ -157,7 +183,6 @@ def generate_missing_scripts_for_old_lesson(data: dict):
 
     with st.spinner("AI đang biên soạn Kịch bản Hội thoại (Role-play) & 3 Script Giảng mẫu và lưu vào Cloud..."):
         try:
-            client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=300000))
             prompt = f"""
             Bạn là chuyên gia đào tạo giáo viên Toán tiếng Anh (EMI). Dựa trên dữ liệu bài học sau:
             - Tóm tắt bài giảng: {data.get('lesson_summary', '')}
@@ -173,14 +198,13 @@ def generate_missing_scripts_for_old_lesson(data: dict):
                - Phong cách 3: Tự nhiên, giàu ngữ điệu như giáo viên bản xứ (Native-like & Engaging)
             """
             res = generate_with_retry(
-                client=client,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=ExtraScriptsOutput,
                     temperature=0.4,
                 ),
-                max_retries=3
+                timeout_ms=300000
             )
             parsed = ExtraScriptsOutput.model_validate_json(res.text)
             extra_dict = parsed.model_dump()
@@ -296,7 +320,6 @@ def ipa_to_latex(phonetic: str) -> str:
     return out
 
 def generate_single_lesson_latex_body(data: dict, numbered_section: bool = False) -> str:
-    """Sinh phần thân LaTeX cho 1 bài học (Bao gồm cả Hội thoại & Script giảng mẫu nếu có)"""
     video_id = data["video_id"]
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     custom_title = escape_latex(data.get("custom_title") or data.get("suggested_title") or "Bài học EMI")
@@ -380,7 +403,6 @@ def generate_single_lesson_latex_body(data: dict, numbered_section: bool = False
 
     body_lines.append(r"\end{enumerate}")
 
-    # Thêm phần Kịch bản Hội thoại nếu có
     if data.get("roleplay_dialogue"):
         scenario = escape_latex(data.get("roleplay_scenario", ""))
         body_lines.extend([
@@ -398,7 +420,6 @@ def generate_single_lesson_latex_body(data: dict, numbered_section: bool = False
             body_lines.append(f"    \\textbf{{[Giáo viên trả lời]:}} ``\\textbf{{{tc_en}}}'' \\textit{{({tc_vi})}}")
         body_lines.append(r"\end{itemize}")
 
-    # Thêm phần Tình huống & Script Giảng mẫu
     body_lines.extend([
         "",
         f"{subsec_cmd}{{5. Tình huống & Script Giảng mẫu (Teach-back Challenge \\& Sample Scripts)}}",
@@ -459,9 +480,8 @@ def generate_latex_document(data: dict, full_document: bool = True) -> str:
     return preamble + body_content + closing
 
 def generate_multi_lessons_latex(lessons_data: list[dict], doc_title: str, full_document: bool = True) -> str:
-    """Xuất gộp cả Chuyên đề hoặc danh sách các bài học được chọn ra 1 file LaTeX duy nhất có Mục lục"""
     bodies = []
-    for idx, l_data in enumerate(lessons_data):
+    for l_data in lessons_data:
         bodies.append(generate_single_lesson_latex_body(l_data, numbered_section=True))
     
     combined_body = "\n\n\\newpage\n\n".join(bodies)
@@ -742,9 +762,8 @@ def trigger_analysis(url_to_analyze: str, force_refresh: bool = False, custom_ti
         except Exception as e:
             st.warning(f"Không kiểm tra được cache trên Supabase: {e}")
 
-    api_key = st.session_state.get("api_key", "").strip()
-    if not api_key:
-        st.error("Vui lòng nhập Gemini API Key ở thanh bên trái (hoặc cấu hình trong Secrets).")
+    if not get_api_keys_list():
+        st.error("Vui lòng nhập ít nhất 1 Gemini API Key ở thanh bên trái (hoặc cấu hình trong Secrets).")
         return
 
     with st.spinner("Đang đo thời lượng video & phân tích chuyên sâu bằng Gemini AI (1-3 phút)..."):
@@ -770,8 +789,6 @@ def trigger_analysis(url_to_analyze: str, force_refresh: bool = False, custom_ti
             use_direct_video = True
 
         try:
-            client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=600000))
-            
             if not use_direct_video and video_duration_sec > 0:
                 target_count, est_minutes = calculate_target_items(video_duration_sec)
                 st.toast(f"⏱️ Video dài ~{est_minutes} phút ➔ Tự động trích xuất {target_count} từ vựng & {target_count} mẫu câu.")
@@ -807,14 +824,13 @@ def trigger_analysis(url_to_analyze: str, force_refresh: bool = False, custom_ti
                 contents_payload = f"{base_prompt}\nTranscript:\n{transcript_text[:60000]}"
 
             response = generate_with_retry(
-                client=client,
                 contents=contents_payload,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=GeminiOutput,
                     temperature=0.3,
                 ),
-                max_retries=4
+                timeout_ms=600000
             )
             parsed = GeminiOutput.model_validate_json(response.text)
             final_title = custom_title_in.strip() if custom_title_in.strip() else parsed.suggested_title
@@ -845,12 +861,9 @@ def trigger_analysis(url_to_analyze: str, force_refresh: bool = False, custom_ti
             st.error(f"⚠️ Lỗi khi gọi Gemini AI: {e}")
 
 def evaluate_audio_with_gemini(audio_bytes: bytes, prompt_text: str) -> str:
-    api_key = st.session_state.get("api_key", "").strip()
-    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=300000))
     response = generate_with_retry(
-        client=client,
         contents=[types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"), prompt_text],
-        max_retries=3
+        timeout_ms=300000
     )
     return response.text
 
@@ -888,9 +901,17 @@ with st.sidebar:
             del st.session_state["analysis"]
             st.rerun()
 
-    with st.expander("⚙️ Cấu hình AI & Độ trễ lặp", expanded=False):
-        api_key = st.text_input("Gemini API Key:", value=DEFAULT_GEMINI_KEY, type="password")
+    with st.expander("⚙️ Cấu hình AI (Nhiều API Key) & Độ trễ lặp", expanded=False):
+        api_key = st.text_input(
+            "Danh sách Gemini API Key (cách nhau bằng dấu phẩy):",
+            value=DEFAULT_GEMINI_KEY,
+            type="password",
+            help="Nhập 2-3 API Key từ các Project khác nhau, cách nhau bởi dấu phẩy (,). Hệ thống tự động nhảy sang Key tiếp theo khi hết lượt."
+        )
         st.session_state["api_key"] = api_key
+        active_keys_count = len(get_api_keys_list())
+        st.caption(f"🔑 Đang nạp sẵn **{active_keys_count}** API Key tự động xoay vòng.")
+        
         extra_buffer = st.slider(
             "⏱️ Cộng thêm giây đệm cuối câu:",
             min_value=0, max_value=6, value=1, step=1
@@ -934,7 +955,6 @@ st.markdown(f"""
 
 # --- 11. HÀM HIỂN THỊ CÔNG CỤ XUẤT LATEX THEO CHUYÊN ĐỀ / CHỌN LẺ BÀI ---
 def render_batch_latex_exporter(key_suffix: str = "main"):
-    """Giao diện cho phép xuất LaTeX cả chuyên đề hoặc tích chọn các bài học tùy ý"""
     if not history_list:
         st.info("Chưa có bài học nào trong kho để xuất LaTeX.")
         return
@@ -1357,14 +1377,12 @@ else:
                     with st.container(border=True):
                         st.markdown(f"#### 🔄 Lượt trao đổi {idx + 1}/{len(dialogue_list)} &nbsp; *(Từ khóa: `{turn.get('target_vocab', '')}`)*")
                         
-                        # Phần của Học sinh (Student)
                         st.markdown(f"🙋‍♂️ **Học sinh (Student):** *\"{turn['student_line']}\"*")
                         st.caption(f"🇻🇳 Tạm dịch: {turn['student_vi']}")
                         render_tts_buttons(turn["student_line"], key_prefix=f"rp_stu_{video_id}_{idx}")
                         
                         st.divider()
                         
-                        # Phần của Giáo viên (Người dùng tập nói & thu âm)
                         st.markdown(f"👨‍🏫 **Giáo viên (Bạn tập nói):** **\"{turn['teacher_line']}\"**")
                         st.caption(f"🇻🇳 Nghĩa: {turn['teacher_vi']}")
                         render_tts_buttons(turn["teacher_line"], key_prefix=f"rp_tea_{video_id}_{idx}")
